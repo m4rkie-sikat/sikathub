@@ -1,2863 +1,476 @@
---[[
-    SIKAT HUB  •  Warnetopia  •  v3.1
-    ---------------------------------------------------------------
-    Tabs
-      Main       - Warnet farm, Auto Quest, Auto Gift / Rare Card, movement
-      Shop       - Auto Buy Rare, Server Hop, Minimart restock / borong, Auto Buff
-      Dashboard  - live stats, low stock alert, Discord webhook
-      Utility    - store / warung teleports, performance tools
-      UI Settings- menu key (default RightAlt), floating menu button, theme, config
-
-    Notes
-      * Travel is a tween with noclip at 20 studs/s (the server rewinds
-        anything faster than about 25). A rewind is detected and the tween
-        restarts slower from wherever the server put you.
-      * Menu: RightAlt opens / closes the window (rebind it in UI Settings).
-        A floating "Menu" button is also available for mobile, and on PC if
-        you switch it on. It is draggable.
-      * Server hop: when no rare item you want is in stock, the hub joins
-        another server, and re-runs itself there with queue_on_teleport.
-        It needs the raw URL of this script (your GitHub raw link).
-      * All in-world actions are done by firing the game's own
-        ProximityPrompts, so the client builds the correct arguments.
-      * Shop purchases use the game's own "buy" action, which the server
-        accepts from anywhere. Buffs ("eat") need you at the warung, so
-        the hub travels there.
-]]
-
----------------------------------------------------------------------
--- services
----------------------------------------------------------------------
-
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local Workspace = game:GetService("Workspace")
-local VirtualUser = game:GetService("VirtualUser")
-local HttpService = game:GetService("HttpService")
-local Lighting = game:GetService("Lighting")
-local TweenService = game:GetService("TweenService")
-local TeleportService = game:GetService("TeleportService")
-
-local LocalPlayer = Players.LocalPlayer
-
-local Remotes = ReplicatedStorage:WaitForChild("Remotes", 30)
-local Action = Remotes and Remotes:WaitForChild("Action", 15)
-local SnapshotEvent = Remotes and Remotes:WaitForChild("Snapshot", 15)
-local DayReportEvent = Remotes and Remotes:WaitForChild("DayReport", 15)
-
----------------------------------------------------------------------
--- reload safety
----------------------------------------------------------------------
-
-if getgenv().WarnetFarm and type(getgenv().WarnetFarm.stop) == "function" then
-    pcall(getgenv().WarnetFarm.stop)
-end
-if getgenv().SikatHub and type(getgenv().SikatHub.unload) == "function" then
-    pcall(getgenv().SikatHub.unload)
-end
-
-local Hub = {
-    alive = true,
-    snap = nil,
-    life = nil,
-    status = "Starting",
-}
-getgenv().SikatHub = Hub
-
----------------------------------------------------------------------
--- shared game data
----------------------------------------------------------------------
-
-local Shared = ReplicatedStorage:FindFirstChild("Shared")
-
-local function req(module)
-    if not module then
-        return nil
-    end
-    local ok, res = pcall(require, module)
-    if ok then
-        return res
-    end
-    return nil
-end
-
-local Strings = req(Shared and Shared:FindFirstChild("Strings"))
-local LifeData = req(Shared and Shared:FindFirstChild("Data") and Shared.Data:FindFirstChild("Life"))
-local Catalog = req(Shared and Shared:FindFirstChild("Data") and Shared.Data:FindFirstChild("Catalog"))
-local GameConfig = req(Shared and Shared:FindFirstChild("GameConfig"))
-local BY_ID = (Catalog and Catalog.BY_ID) or {}
-
-local FALLBACK_STRINGS = {
-    lifeTake = "Take",
-    pGift = "Gift!",
-    pCard = "Rare card!",
-    pCat = "The runaway orange cat",
-    lifeCatch = "Catch",
-    lifeTalk = "Talk",
-    pHandIn = "Hand over to {name}",
-    nextDay = "Lanjut ke Hari {day}",
-}
-
-local function tr(key, vars)
-    if Strings and type(Strings.t) == "function" then
-        local ok, res = pcall(Strings.t, key, vars)
-        if ok and type(res) == "string" then
-            return res
-        end
-    end
-    local base = FALLBACK_STRINGS[key] or key
-    if vars then
-        base = base:gsub("{(%w+)}", function(k)
-            return tostring(vars[k] or "")
-        end)
-    end
-    return base
-end
-
----------------------------------------------------------------------
--- snapshot state
----------------------------------------------------------------------
-
-local function onSnapshot(payload)
-    if type(payload) ~= "table" then
-        return
-    end
-    Hub.snap = payload
-    if payload.life then
-        Hub.life = payload.life
-    end
-end
-
-local snapConn
-if SnapshotEvent then
-    snapConn = SnapshotEvent.OnClientEvent:Connect(onSnapshot)
-end
-
-local function snap()
-    return Hub.snap
-end
-
-local function life()
-    return Hub.life or (Hub.snap and Hub.snap.life)
-end
-
----------------------------------------------------------------------
--- character helpers
----------------------------------------------------------------------
-
-local function getChar()
-    return LocalPlayer.Character
-end
-
-local function getRoot()
-    local char = getChar()
-    return char and char:FindFirstChild("HumanoidRootPart")
-end
-
-local function getHum()
-    local char = getChar()
-    return char and char:FindFirstChildOfClass("Humanoid")
-end
-
----------------------------------------------------------------------
--- movement lock (farm / quest / collect / shop / buff take turns)
----------------------------------------------------------------------
-
-local Lock = { holder = nil, expires = 0 }
-
-local function acquire(name, ttl)
-    local now = os.clock()
-    if Lock.holder and Lock.holder ~= name and now < Lock.expires then
-        return false
-    end
-    Lock.holder = name
-    Lock.expires = now + (ttl or 4)
-    return true
-end
-
-local function release(name)
-    if Lock.holder == name then
-        Lock.holder = nil
-        Lock.expires = 0
-    end
-end
-
----------------------------------------------------------------------
--- travel: tween + noclip
----------------------------------------------------------------------
-
--- The server is authoritative over position and rewinds anything faster than
--- roughly 25 studs/s. A linear tween at 20 studs/s tested with zero rewinds
--- over 130 stud trips (25 and 30 studs/s both rewound), so that is the default.
--- Noclip is forced on for the whole trip so the straight line never snags on
--- a wall, and the tween re-zeroes velocity every frame so physics cannot
--- fight it. If the server ever does rewind, the tween is cancelled and
--- restarted from wherever the server put the character, 15% slower.
-local Travel = { speed = 20, active = false }
-
-local function safeTeleport(pos, opts)
-    opts = opts or {}
-    local offset = opts.offset or 3
-    local stand = Vector3.new(pos.X, pos.Y + offset, pos.Z)
-    local tolerance = opts.tolerance or 6
-    local deadline = os.clock() + (opts.timeout or 40)
-
-    local root = getRoot()
-    if not root or not getHum() then
-        return false
-    end
-
-    local function flatTo(p)
-        return (Vector2.new(p.X, p.Z) - Vector2.new(stand.X, stand.Z)).Magnitude
-    end
-
-    -- a short hop is accepted by the server as one step
-    if flatTo(root.Position) <= 30 and math.abs(root.Position.Y - stand.Y) <= 25 then
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.CFrame = CFrame.new(stand)
-        task.wait(0.2)
-        root = getRoot()
-        if root and flatTo(root.Position) <= tolerance then
-            return true
-        end
-    end
-
-    local attempts = 0
-    local arrived = false
-    Travel.active = true
-
-    while attempts < 6 and os.clock() < deadline and Hub.alive do
-        attempts = attempts + 1
-        root = getRoot()
-        if not root then
-            break
-        end
-
-        local from = root.Position
-        local distance = (stand - from).Magnitude
-        if flatTo(from) <= tolerance then
-            arrived = true
-            break
-        end
-
-        local speed = math.max(8, Travel.speed * (0.85 ^ (attempts - 1)))
-        local tween = TweenService:Create(
-            root,
-            TweenInfo.new(distance / speed, Enum.EasingStyle.Linear),
-            { CFrame = CFrame.new(stand) }
-        )
-        local direction = (stand - from).Unit
-        local furthest = 0
-        local rewound = false
-
-        tween:Play()
-        while tween.PlaybackState == Enum.PlaybackState.Playing and os.clock() < deadline and Hub.alive do
-            root = getRoot()
-            if not root then
-                tween:Cancel()
-                break
-            end
-            root.AssemblyLinearVelocity = Vector3.zero
-            local along = (root.Position - from):Dot(direction)
-            if along < furthest - 6 then
-                rewound = true
-                tween:Cancel()
-                break
-            end
-            furthest = math.max(furthest, along)
-            task.wait()
-        end
-
-        root = getRoot()
-        if root then
-            root.AssemblyLinearVelocity = Vector3.zero
-            if not rewound and flatTo(root.Position) <= tolerance then
-                arrived = true
-                break
-            end
-        end
-        task.wait(0.1)
-    end
-
-    Travel.active = false
-    task.wait(0.1)
-    return arrived
-end
-
-local function firePrompt(prompt)
-    if not prompt or not prompt.Enabled then
-        return false
-    end
-    local fn = getgenv().fireproximityprompt
-    if type(fn) == "function" then
-        local ok = pcall(fn, prompt)
-        if ok then
-            return true
-        end
-    end
-    local ok = pcall(function()
-        prompt:InputHoldBegin()
-        task.wait(math.max(prompt.HoldDuration or 0, 0.05))
-        prompt:InputHoldEnd()
-    end)
-    return ok
-end
-
--- travel next to a part, then fire its prompt
-local function hopAndFire(part, prompt, opts)
-    if not part or not prompt then
-        return false
-    end
-    if not safeTeleport(part.Position, opts) then
-        return false
-    end
-    return firePrompt(prompt)
-end
-
----------------------------------------------------------------------
--- world lookups
----------------------------------------------------------------------
-
-local function lotsFolder()
-    local map = Workspace:FindFirstChild("Map")
-    return map and map:FindFirstChild("Lots")
-end
-
-local function myLot()
-    local s = snap()
-    local number = (s and s.lot) or 2
-    local lots = lotsFolder()
-    return lots and lots:FindFirstChild("Lot" .. tostring(number))
-end
-
-local function spotsFolder()
-    local map = Workspace:FindFirstChild("Map")
-    local town = map and map:FindFirstChild("Town")
-    return town and town:FindFirstChild("Spots")
-end
-
-local function findSpot(kind, id)
-    local spots = spotsFolder()
-    if not spots then
-        return nil
-    end
-    for _, part in ipairs(spots:GetChildren()) do
-        if part:GetAttribute("Kind") == kind and part:GetAttribute("Id") == id then
-            return part
-        end
-    end
-    return nil
-end
-
--- storefronts face -Z when the door sits north of the street, +Z otherwise
-local function frontOf(part, distance)
-    local dir = part.Position.Z > -25 and -1 or 1
-    return part.Position + Vector3.new(0, 1, (distance or 5) * dir)
-end
-
-local function findPromptIn(model, matcher)
-    if not model then
-        return nil
-    end
-    local fallback
-    for _, d in ipairs(model:GetDescendants()) do
-        if d:IsA("ProximityPrompt") then
-            if matcher and matcher(d) then
-                if d.Enabled then
-                    return d
-                end
-                fallback = fallback or d
-            elseif not matcher then
-                if d.Enabled then
-                    return d
-                end
-                fallback = fallback or d
-            end
-        end
-    end
-    return fallback
-end
-
-local function promptPart(prompt)
-    if not prompt then
-        return nil
-    end
-    local parent = prompt.Parent
-    if parent and parent:IsA("BasePart") then
-        return parent
-    end
-    if parent and parent:IsA("Model") then
-        return parent.PrimaryPart or parent:FindFirstChildWhichIsA("BasePart")
-    end
-    return nil
-end
-
----------------------------------------------------------------------
--- speed boost
---   the server owns WalkSpeed, so the value is simply re-applied every
---   frame while the toggle is on, and put back when it is switched off
----------------------------------------------------------------------
-
-local Speed = { enabled = false, value = 60, original = nil }
-
-local function dropSpeed()
-    local hum = getHum()
-    if hum and Speed.original then
-        hum.WalkSpeed = Speed.original
-    end
-    Speed.original = nil
-end
-
-local function applySpeed()
-    local hum = getHum()
-    if not hum then
-        return
-    end
-    if Speed.enabled then
-        if not Speed.original then
-            Speed.original = hum.WalkSpeed
-        end
-        hum.WalkSpeed = Speed.value
-    end
-end
-
----------------------------------------------------------------------
--- fly (movement is server validated, so this nudges the character in
--- small steps instead of using velocity)
----------------------------------------------------------------------
-
-local Fly = { enabled = false, speed = 50, savedSpeed = nil }
-
-local function dropFly()
-    local hum = getHum()
-    if hum and Fly.savedSpeed then
-        hum.WalkSpeed = Fly.savedSpeed
-    end
-    Fly.savedSpeed = nil
-end
-
----------------------------------------------------------------------
--- misc movement
----------------------------------------------------------------------
-
-local Misc = { noclip = false, infJump = false, antiAfk = false }
-
----------------------------------------------------------------------
--- warnet farm
----------------------------------------------------------------------
-
-local Farm = {
-    keepOpen = false,
-    serve = false,
-    deliver = false,
-    cook = false,
-    clean = false,
-    repair = false,
-    like = false,
-    dayReport = false,
-    cookBelow = 6,
-    served = 0,
-    delivered = 0,
-    cleaned = 0,
-    repaired = 0,
-    cooked = 0,
-    lastLike = 0,
-    lastAction = "",
-}
-
-local COOK_ITEMS = {
-    { key = "mie", id = "noodle" },
-    { key = "nasi", id = "rice" },
-    { key = "soda", id = "soda" },
-    { key = "teh", id = "tea" },
-    { key = "kopi", id = "coffee" },
-    { key = "snack", id = "snack" },
-}
-
-local function cookItemFor(text)
-    local lower = string.lower(text or "")
-    for _, entry in ipairs(COOK_ITEMS) do
-        if lower:find(entry.key, 1, true) then
-            return entry.id
-        end
-    end
-    return nil
-end
-
-local function farmEnabled()
-    return Farm.keepOpen
-        or Farm.serve
-        or Farm.deliver
-        or Farm.cook
-        or Farm.clean
-        or Farm.repair
-        or Farm.like
-end
-
-local function collectFarmTargets()
-    local lot = myLot()
-    if not lot then
-        return {}
-    end
-
-    local out = {}
-
-    local people = lot:FindFirstChild("People")
-    if people then
-        for _, model in ipairs(people:GetChildren()) do
-            local root = model:FindFirstChild("Root")
-            local prompt = root and root:FindFirstChild("Prompt")
-            if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled then
-                local action = prompt.ActionText or ""
-                if action == "Layani" then
-                    table.insert(out, { kind = "serve", prompt = prompt, part = root, label = model.Name })
-                elseif string.sub(action, 1, 5) == "Antar" then
-                    table.insert(out, { kind = "deliver", prompt = prompt, part = root, label = model.Name })
-                end
-            end
-        end
-    end
-
-    local objects = lot:FindFirstChild("Objects")
-    if objects then
-        for _, obj in ipairs(objects:GetChildren()) do
-            for _, d in ipairs(obj:GetDescendants()) do
-                if d:IsA("ProximityPrompt") and d.Enabled then
-                    local action = string.lower(d.ActionText or "")
-                    local object = string.lower(d.ObjectText or "")
-                    if action:find("bersih", 1, true) then
-                        table.insert(out, { kind = "clean", prompt = d, part = obj })
-                    elseif action:find("perbaiki", 1, true) or action:find("servis", 1, true) or action:find("repair", 1, true) or object:find("rusak", 1, true) then
-                        table.insert(out, { kind = "repair", prompt = d, part = obj })
-                    elseif action:find("buat ", 1, true) then
-                        table.insert(out, { kind = "cook", prompt = d, part = obj, item = cookItemFor(action) })
-                    end
-                end
-            end
-        end
-    end
-
-    return out
-end
-
-local FARM_PRIORITY = { serve = 1, deliver = 2, clean = 3, repair = 4, cook = 5 }
-
-local function farmCycle()
-    local s = snap()
-    if not s then
-        return
-    end
-
-    if Farm.keepOpen and not s.open then
-        if Action then
-            Action:FireServer("setOpen", { open = true })
-            Farm.lastAction = "Opening the warnet"
-            task.wait(0.6)
-        end
-        return
-    end
-
-    if not s.open then
-        return
-    end
-
-    local targets = collectFarmTargets()
-    table.sort(targets, function(a, b)
-        return (FARM_PRIORITY[a.kind] or 9) < (FARM_PRIORITY[b.kind] or 9)
-    end)
-
-    for _, target in ipairs(targets) do
-        if not Hub.alive then
-            return
-        end
-
-        local enabled = (target.kind == "serve" and Farm.serve)
-            or (target.kind == "deliver" and Farm.deliver)
-            or (target.kind == "clean" and Farm.clean)
-            or (target.kind == "repair" and Farm.repair)
-            or (target.kind == "cook" and Farm.cook)
-
-        if enabled then
-            local skip = false
-            if target.kind == "cook" and target.item then
-                local stock = (s.stock and s.stock[target.item]) or 0
-                if stock >= Farm.cookBelow then
-                    skip = true
-                end
-            end
-
-            if not skip and acquire("farm", 6) then
-                local ok = hopAndFire(target.part, target.prompt)
-                if ok then
-                    if target.kind == "serve" then
-                        Farm.served = Farm.served + 1
-                        Farm.lastAction = "Served " .. tostring(target.label or "customer")
-                    elseif target.kind == "deliver" then
-                        Farm.delivered = Farm.delivered + 1
-                        Farm.lastAction = "Delivered to " .. tostring(target.label or "customer")
-                    elseif target.kind == "clean" then
-                        Farm.cleaned = Farm.cleaned + 1
-                        Farm.lastAction = "Cleaned trash"
-                    elseif target.kind == "repair" then
-                        Farm.repaired = Farm.repaired + 1
-                        Farm.lastAction = "Repaired a station"
-                    elseif target.kind == "cook" then
-                        Farm.cooked = Farm.cooked + 1
-                        Farm.lastAction = "Cooked " .. tostring(target.item or "food")
-                    end
-                end
-                release("farm")
-                task.wait(0.12)
-            end
-        end
-    end
-
-    if Farm.like and os.clock() - Farm.lastLike > 45 then
-        local lot = myLot()
-        local shell = lot and lot:FindFirstChild("Shell")
-        local sign = shell and shell:FindFirstChild("LikeSign")
-        local prompt = sign and sign:FindFirstChild("Prompt")
-        if prompt and prompt.Enabled and acquire("farm", 6) then
-            if hopAndFire(sign, prompt) then
-                Farm.lastLike = os.clock()
-                Farm.lastAction = "Liked the warnet"
-            end
-            release("farm")
-        end
-    end
-end
-
----------------------------------------------------------------------
--- auto quest
----------------------------------------------------------------------
-
-local Quest = {
-    enabled = false,
-    types = { deliver = true, fetch = true, cat = true },
-    accepted = 0,
-    stage = "idle",
-    lastId = nil,
-    lastTry = 0,
-}
-
-local function offerKind(offer)
-    local kind = string.lower(tostring(offer and offer.type or ""))
-    if kind:find("cat", 1, true) or kind:find("kucing", 1, true) then
-        return "cat"
-    end
-    if kind:find("fetch", 1, true) or kind:find("buy", 1, true) or kind:find("item", 1, true) or kind:find("beli", 1, true) then
-        return "fetch"
-    end
-    return "deliver"
-end
-
-local function pickOffer(offers)
-    if type(offers) ~= "table" then
-        return nil
-    end
-    local best, bestReward = nil, -math.huge
-    for _, offer in ipairs(offers) do
-        if type(offer) == "table" and offer.id and Quest.types[offerKind(offer)] then
-            local money = (offer.reward and offer.reward.money) or 0
-            if money > bestReward then
-                best = offer
-                bestReward = money
-            end
-        end
-    end
-    return best
-end
-
-local function findEnabledHouseDoor()
-    local spots = spotsFolder()
-    if not spots then
-        return nil
-    end
-    for _, part in ipairs(spots:GetChildren()) do
-        if part:GetAttribute("Kind") == "house" then
-            local prompt = part:FindFirstChild("Prompt")
-            if prompt and prompt:IsA("ProximityPrompt") and prompt.Enabled then
-                return prompt, part
-            end
-        end
-    end
-    return nil
-end
-
-local function findGiver(name)
-    local clientLife = Workspace:FindFirstChild("ClientLife")
-    if not clientLife or not name then
-        return nil
-    end
-    local model = clientLife:FindFirstChild(name)
-    if not model then
-        for _, child in ipairs(clientLife:GetChildren()) do
-            if string.find(string.lower(child.Name), string.lower(name), 1, true) then
-                model = child
-                break
-            end
-        end
-    end
-    if not model then
-        return nil
-    end
-    local prompt = findPromptIn(model)
-    return prompt, promptPart(prompt)
-end
-
-local function findCatPrompt()
-    local clientLife = Workspace:FindFirstChild("ClientLife")
-    if not clientLife then
-        return nil
-    end
-    local want = string.lower(tr("pCat"))
-    for _, child in ipairs(clientLife:GetChildren()) do
-        for _, d in ipairs(child:GetDescendants()) do
-            if d:IsA("ProximityPrompt") then
-                local object = string.lower(d.ObjectText or "")
-                local action = string.lower(d.ActionText or "")
-                if d.Enabled and (object == want or object:find("kucing", 1, true) or object:find("cat", 1, true) or action:find("tangkap", 1, true) or action:find("catch", 1, true)) then
-                    return d, promptPart(d)
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function questCycle()
-    if not Action then
-        return
-    end
-    local l = life()
-    if not l then
-        return
-    end
-
-    local active = l.active
-    if type(active) ~= "table" then
-        Quest.stage = "idle"
-        local offer = pickOffer(l.offers)
-        if offer and offer.id ~= Quest.lastId then
-            Action:FireServer("accept", { id = offer.id })
-            Quest.lastId = offer.id
-            Quest.accepted = Quest.accepted + 1
-            Quest.stage = "accepted"
-            Hub.status = "Accepted a quest"
-            task.wait(0.8)
-        end
-        return
-    end
-
-    local stage = tostring(active.stage or "")
-    Quest.stage = stage
-
-    if stage == "return" then
-        local prompt, part = findGiver(active.name)
-        if prompt and part and acquire("quest", 45) then
-            hopAndFire(part, prompt)
-            release("quest")
-        end
-    elseif stage == "deliver" then
-        local prompt, part = findEnabledHouseDoor()
-        if prompt and part and acquire("quest", 45) then
-            hopAndFire(part, prompt)
-            release("quest")
-        end
-    elseif stage == "buy" then
-        if active.item and acquire("quest", 3) then
-            Action:FireServer("questBuy", { item = active.item })
-            release("quest")
-            task.wait(0.6)
-        end
-    elseif stage == "find" then
-        local prompt, part = findCatPrompt()
-        if prompt and part and acquire("quest", 45) then
-            hopAndFire(part, prompt)
-            release("quest")
-        end
-    end
-end
-
----------------------------------------------------------------------
--- auto gift / rare card
----------------------------------------------------------------------
-
-local Collect = {
-    gifts = false,
-    cards = false,
-    giftsClaimed = 0,
-    cardsClaimed = 0,
-}
-
-local function claimWorldItem(model, opts)
-    if not model then
-        return false
-    end
-    local prompt = findPromptIn(model)
-    if not prompt or not prompt.Enabled then
-        return false
-    end
-    local part = promptPart(prompt)
-    if not part then
-        return false
-    end
-    return hopAndFire(part, prompt, opts)
-end
-
-local function collectCycle()
-    local clientLife = Workspace:FindFirstChild("ClientLife")
-    if not clientLife then
-        return
-    end
-
-    if Collect.gifts and acquire("collect", 45) then
-        local gift = clientLife:FindFirstChild("Gift")
-        if gift and claimWorldItem(gift) then
-            Collect.giftsClaimed = Collect.giftsClaimed + 1
-            Hub.status = "Claimed a gift"
-            task.wait(0.4)
-        end
-        release("collect")
-    end
-
-    if Collect.cards and acquire("collect", 45) then
-        local card = clientLife:FindFirstChild("RareCard")
-        if card and claimWorldItem(card) then
-            Collect.cardsClaimed = Collect.cardsClaimed + 1
-            Hub.status = "Claimed a rare card"
-            task.wait(0.4)
-        end
-        release("collect")
-    end
-end
-
----------------------------------------------------------------------
--- auto day report (close the modal so it never blocks the farm)
----------------------------------------------------------------------
-
-local function clickGuiButton(button)
-    if not button then
-        return false
-    end
-    local done = false
-    local getconns = getgenv().getconnections
-    if type(getconns) == "function" then
-        for _, signal in ipairs({ button.MouseButton1Click, button.Activated }) do
-            local ok, conns = pcall(getconns, signal)
-            if ok and type(conns) == "table" then
-                for _, conn in ipairs(conns) do
-                    if type(conn.Function) == "function" then
-                        pcall(conn.Function)
-                        done = true
-                    end
-                end
-            end
-        end
-    end
-    if not done then
-        local firesignal = getgenv().firesignal
-        if type(firesignal) == "function" then
-            pcall(firesignal, button.MouseButton1Click)
-            done = true
-        end
-    end
-    return done
-end
-
-local function closeDayReport()
-    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if not playerGui then
-        return false
-    end
-    local needle = string.lower(string.gsub(tr("nextDay", { day = 1 }), "%d+", ""))
-    for _, d in ipairs(playerGui:GetDescendants()) do
-        if d:IsA("TextButton") and d.Visible then
-            local text = string.lower(d.Text or "")
-            if text:find(needle, 1, true) or text:find("lanjut", 1, true) or text:find("next day", 1, true) then
-                return clickGuiButton(d)
-            end
-        end
-    end
-    return false
-end
-
-local dayConn
-if DayReportEvent then
-    dayConn = DayReportEvent.OnClientEvent:Connect(function()
-        if not Farm.dayReport then
-            return
-        end
-        task.delay(1, function()
-            if Farm.dayReport then
-                closeDayReport()
-            end
-        end)
-    end)
-end
-
----------------------------------------------------------------------
--- Obsidian UI
----------------------------------------------------------------------
-
-local repo = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
-local okLib, Library = pcall(function()
-    return loadstring(game:HttpGet(repo .. "Library.lua"))()
-end)
-if not okLib or not Library then
-    warn("[Sikat Hub] Could not load the UI library.")
-    return
-end
-
-local ThemeManager = select(2, pcall(function()
-    return loadstring(game:HttpGet(repo .. "addons/ThemeManager.lua"))()
-end))
-local SaveManager = select(2, pcall(function()
-    return loadstring(game:HttpGet(repo .. "addons/SaveManager.lua"))()
-end))
-
--- no logo on purpose: the window shows just the title
-local Window = Library:CreateWindow({
-    Title = "Sikat Hub",
-    Footer = "Warnetopia • v3.1",
-    NotifySide = "Right",
-    ShowCustomCursor = true,
-})
-
-local Tabs = {
-    Main = Window:AddTab("Main", "home"),
-    Shop = Window:AddTab("Shop", "shopping-cart"),
-    Dashboard = Window:AddTab("Dashboard", "layout-dashboard"),
-    Utility = Window:AddTab("Utility", "wrench"),
-    Settings = Window:AddTab("UI Settings", "settings"),
-}
-
-local function notify(text)
-    pcall(function()
-        Library:Notify({
-            Title = "Sikat Hub",
-            Description = tostring(text),
-            Time = 3,
-        })
-    end)
-end
-
----------------------------------------------------------------------
--- menu toggle: keybind + floating button
----------------------------------------------------------------------
-
-local function toggleMenu()
-    pcall(function()
-        Library:Toggle()
-    end)
-end
-
-local Float = { enabled = UserInputService.TouchEnabled, gui = nil, conns = {} }
-
-local function destroyFloat()
-    for _, c in ipairs(Float.conns) do
-        pcall(function()
-            c:Disconnect()
-        end)
-    end
-    Float.conns = {}
-    if Float.gui then
-        pcall(function()
-            Float.gui:Destroy()
-        end)
-        Float.gui = nil
-    end
-end
-
-local function buildFloat()
-    destroyFloat()
-    if not Float.enabled or not Hub.alive then
-        return
-    end
-
-    local parent
-    pcall(function()
-        parent = getgenv().gethui and getgenv().gethui()
-    end)
-    parent = parent or game:GetService("CoreGui")
-
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "SikatMenuButton"
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 1000
-    gui.IgnoreGuiInset = true
-    gui.Parent = parent
-
-    local button = Instance.new("TextButton")
-    button.Name = "Toggle"
-    button.Size = UDim2.fromOffset(72, 36)
-    button.Position = UDim2.new(0, 14, 0.5, -18)
-    button.AutoButtonColor = true
-    button.BackgroundColor3 = Color3.fromRGB(24, 24, 30)
-    button.BackgroundTransparency = 0.1
-    button.Text = "Menu"
-    button.TextColor3 = Color3.fromRGB(240, 240, 245)
-    button.TextSize = 15
-    button.Font = Enum.Font.GothamMedium
-    button.Parent = gui
-
-    local corner = Instance.new("UICorner")
-    corner.CornerRadius = UDim.new(0, 10)
-    corner.Parent = button
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(90, 90, 110)
-    stroke.Thickness = 1
-    stroke.Parent = button
-
-    local dragging, moved = false, false
-    local dragStart, startPos
-
-    table.insert(Float.conns, button.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = true
-            moved = false
-            dragStart = input.Position
-            startPos = button.Position
-        end
-    end))
-
-    table.insert(Float.conns, UserInputService.InputChanged:Connect(function(input)
-        if not dragging then
-            return
-        end
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            local delta = input.Position - dragStart
-            if delta.Magnitude > 6 then
-                moved = true
-            end
-            button.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + delta.X,
-                startPos.Y.Scale, startPos.Y.Offset + delta.Y
-            )
-        end
-    end))
-
-    table.insert(Float.conns, UserInputService.InputEnded:Connect(function(input)
-        if not dragging then
-            return
-        end
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            dragging = false
-            if not moved then
-                toggleMenu()
-            end
-        end
-    end))
-
-    Float.gui = gui
-end
-
----------------------------------------------------------------------
--- shop: auto buy rare, minimart restock / borong
----------------------------------------------------------------------
-
-local STOCK_CAP = 100 -- the cafe never holds more than this per ingredient
-
-local SHOP_STORES = {
-    ["Toko Komputer Jaya"] = "computer",
-    ["Mebel Jati"] = "furniture",
-    ["Galeri Dekorasi"] = "decor",
-    ["Toko Alat Kafe"] = "kitchen",
-    ["Rumah Idaman"] = "home",
-}
-local SHOP_STORE_NAMES = { "Toko Komputer Jaya", "Mebel Jati", "Galeri Dekorasi", "Toko Alat Kafe", "Rumah Idaman" }
-local RARITY_KEYS = { ["Langka"] = "langka", ["Sangat Langka"] = "sangat_langka", ["Eksklusif"] = "eksklusif" }
-local RARITY_NAMES = { "Langka", "Sangat Langka", "Eksklusif" }
-local RARITY_RANK = { langka = 1, sangat_langka = 2, eksklusif = 3 }
-local CATEGORIES = { "PC, Case & Konsol", "Monitor & TV", "Keyboard", "Mouse", "Mousepad", "Meja & Kursi", "Dekorasi" }
-local TIERS = { "T1 (All)", "T2+", "T3+", "T4" }
-local FOOD_NAMES = { snack = "Snack", tea = "Es Teh", soda = "Soda", coffee = "Kopi", noodle = "Mie", rice = "Nasi" }
-local FOOD_ORDER = { "snack", "tea", "soda", "coffee", "noodle", "rice" }
-
-local Shop = {
-    rare = false,
-    minTier = 1,
-    rarity = { langka = true, sangat_langka = true, eksklusif = true },
-    stores = { computer = true, furniture = true, decor = true, kitchen = true, home = true },
-    cats = {},
-    maxPrice = 0,
-    perItem = 3,
-    reserve = 5,
-    restock = false,
-    restockBelow = 10,
-    borong = false,
-    bought = 0,
-    spent = 0,
-    last = "-",
-    failUntil = {},
-}
-
-local Alerts = {
-    lowStock = false,
-    below = 10,
-    webhookOn = false,
-    webhookUrl = "",
-    dayWebhook = false,
-    autoFair = false,
-    sent = {},
-}
-
-local function fmt(n)
-    if type(n) ~= "number" then
-        return "?"
-    end
-    local neg = n < 0
-    local s = tostring(math.floor(math.abs(n) + 0.5))
-    s = s:reverse():gsub("(%d%d%d)", "%1."):reverse()
-    if s:sub(1, 1) == "." then
-        s = s:sub(2)
-    end
-    return (neg and "-$" or "$") .. s
-end
-
-local function notifyT(title, text, secs)
-    pcall(function()
-        Library:Notify({ Title = title, Description = tostring(text), Time = secs or 4 })
-    end)
-end
-
-local function webhook(text)
-    local url = Alerts.webhookUrl
-    if not Alerts.webhookOn or type(url) ~= "string" then
-        return
-    end
-    local okUrl = url:find("^https://discord%.com/api/webhooks/")
-        or url:find("^https://discordapp%.com/api/webhooks/")
-        or url:find("^https://ptb%.discord%.com/api/webhooks/")
-        or url:find("^https://canary%.discord%.com/api/webhooks/")
-    local requester = getgenv().request or getgenv().http_request or (getgenv().syn and getgenv().syn.request)
-    if not (okUrl and requester) then
-        return
-    end
-    task.spawn(pcall, requester, {
-        Url = url,
-        Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = HttpService:JSONEncode({ username = "Sikat Hub", content = text }),
-    })
-end
-
-local function catOf(it)
-    local k = it.kind or ""
-    if k == "unit_pc" or k == "unit_console" then
-        return CATEGORIES[1]
-    elseif k == "display" then
-        return CATEGORIES[2]
-    elseif k == "keyboard" then
-        return CATEGORIES[3]
-    elseif k == "mouse" then
-        return CATEGORIES[4]
-    elseif k:find("pad") then
-        return CATEGORIES[5]
-    elseif k == "desk" or k == "seat" then
-        return CATEGORIES[6]
-    end
-    return CATEGORIES[7]
-end
-
-local function shelfStock(store, id)
-    local s = snap()
-    local shelf = s and s.shops and s.shops.shelves and s.shops.shelves[store]
-    return shelf and shelf[id] or 0
-end
-
-local function purchasesNow()
-    local s = snap()
-    local exp = s and s.today and s.today.expense
-    return exp and exp.purchases or 0
-end
-
-local function rareJobs(s)
-    local jobs = {}
-    local shelves = s.shops and s.shops.shelves
-    if not shelves then
-        return jobs
-    end
-    local reserve = Shop.reserve * 1e6
-    local maxPrice = Shop.maxPrice * 1e6
-    for store, items in pairs(shelves) do
-        if Shop.stores[store] and type(items) == "table" then
-            for id, stock in pairs(items) do
-                local it = BY_ID[id]
-                if stock > 0 and it and it.town and it.rarity ~= "biasa" and Shop.rarity[it.rarity] then
-                    local okTier = (it.tier or Shop.minTier) >= Shop.minTier
-                    local okPrice = maxPrice <= 0 or it.price <= maxPrice
-                    local okLevel = (s.level or 1) >= (it.level or 1)
-                    local okCat = next(Shop.cats) == nil or Shop.cats[catOf(it)]
-                    local cooling = (Shop.failUntil[id] or 0) > os.clock()
-                    if okTier and okPrice and okLevel and okCat and not cooling then
-                        local afford = math.floor(((s.money or 0) - reserve) / math.max(it.price, 1))
-                        local qty = math.min(stock, Shop.perItem, afford)
-                        if qty >= 1 then
-                            table.insert(jobs, { store = store, id = id, it = it, qty = qty })
-                        end
-                    end
-                end
-            end
-        end
-    end
-    table.sort(jobs, function(a, b)
-        local ra, rb = RARITY_RANK[a.it.rarity] or 0, RARITY_RANK[b.it.rarity] or 0
-        if ra ~= rb then
-            return ra > rb
-        end
-        return (a.it.tier or 0) > (b.it.tier or 0)
-    end)
-    return jobs
-end
-
--- each ingredient "buy" adds it.qty (10) to the cafe stock, which is capped at STOCK_CAP
-local function minimartJobs(s, onlyLow)
-    local jobs = {}
-    local shelf = s.shops and s.shops.shelves and s.shops.shelves.minimart
-    if not shelf then
-        return jobs
-    end
-    local reserve = Shop.reserve * 1e6
-    for id, stock in pairs(shelf) do
-        if stock > 0 and (Shop.failUntil[id] or 0) <= os.clock() then
-            local key = id:gsub("^stock_", "")
-            local have = s.stock and s.stock[key]
-            if type(have) == "number" then
-                local it = BY_ID[id]
-                local pack = (it and it.qty) or 10
-                local price = (it and it.price) or 0
-                local room = math.floor((STOCK_CAP - have) / pack)
-                local afford = price > 0 and math.floor(((s.money or 0) - reserve) / price) or stock
-                local qty = math.min(stock, room, afford)
-                local want = (not onlyLow) or have < Shop.restockBelow
-                if want and qty >= 1 then
-                    table.insert(jobs, { store = "minimart", id = id, it = it, qty = qty })
-                end
-            end
-        end
-    end
-    return jobs
-end
-
-local function sendBuys(id, qty)
-    for _ = 1, qty do
-        if not Hub.alive then
-            return
-        end
-        Action:FireServer("buy", { id = id })
-        task.wait(0.12)
-    end
-end
-
--- The server accepts "buy" from anywhere, so this normally never moves the
--- character. If nothing was sold, it travels to the store once and tries again.
-local function buyBatch(store, id, qty)
-    if not Action then
-        return 0
-    end
-    local before, spentBefore = shelfStock(store, id), purchasesNow()
-    local it = BY_ID[id]
-
-    local function soldNow()
-        local byShelf = math.max(0, before - shelfStock(store, id))
-        local byMoney = (it and it.price and it.price > 0) and math.floor((purchasesNow() - spentBefore) / it.price + 0.5) or 0
-        return math.max(byShelf, byMoney)
-    end
-
-    sendBuys(id, qty)
-    task.wait(0.8)
-    local sold = soldNow()
-    if sold >= 1 then
-        return sold
-    end
-
-    local door = findSpot("store", store)
-    if door and acquire("shop", 90) then
-        local root = getRoot()
-        local home = root and root.Position
-        if safeTeleport(frontOf(door, 5), { timeout = 45 }) then
-            sendBuys(id, qty)
-            task.wait(0.8)
-            sold = soldNow()
-        end
-        if home then
-            safeTeleport(home, { offset = 0, timeout = 45 })
-        end
-        release("shop")
-    end
-    if sold < 1 then
-        Shop.failUntil[id] = os.clock() + 90
-    end
-    return sold
-end
-
-local function recordBuy(it, id, sold)
-    if sold < 1 then
-        return
-    end
-    local price = (it and it.price) or 0
-    Shop.bought = Shop.bought + sold
-    Shop.spent = Shop.spent + price * sold
-    local name = (it and it.name) or id
-    Shop.last = string.format("%dx %s", sold, name)
-    notifyT("Bought", Shop.last .. " (" .. fmt(price * sold) .. ")", 4)
-    webhook(string.format("Bought %dx **%s** for %s", sold, name, fmt(price * sold)))
-end
-
-local function runJobs(jobs, limit)
-    local done = 0
-    for _, j in ipairs(jobs) do
-        if not Hub.alive or done >= limit then
-            break
-        end
-        recordBuy(j.it, j.id, buyBatch(j.store, j.id, j.qty))
-        done = done + 1
-        task.wait(0.2)
-    end
-end
-
-local function shopCycle()
-    local s = snap()
-    if not s or not Catalog then
-        return
-    end
-    if Shop.rare then
-        runJobs(rareJobs(s), 3)
-    end
-    s = snap()
-    if not s then
-        return
-    end
-    if Shop.borong then
-        runJobs(minimartJobs(s, false), 2)
-    elseif Shop.restock then
-        runJobs(minimartJobs(s, true), 2)
-    end
-end
-
-local function shopEnabled()
-    return Shop.rare or Shop.restock or Shop.borong
-end
-
----------------------------------------------------------------------
--- server hop for rare stock
---   joins another server when nothing you want is on the shelves, and
---   runs the hub again there (queue_on_teleport). A small flag file
---   remembers that hopping is on, so it keeps going after each hop.
----------------------------------------------------------------------
-
-local HOP_FOLDER = "SikatHub"
-local HOP_FLAG = HOP_FOLDER .. "/hop.flag"
-
-local Hop = {
-    enabled = false,
-    url = "",
-    settle = 20,
-    startedAt = os.clock(),
-    hops = 0,
-    busy = false,
-    lastStatus = "off",
-}
-
-local function writeHopFlag(on)
-    pcall(function()
-        if makefolder and isfolder and not isfolder(HOP_FOLDER) then
-            makefolder(HOP_FOLDER)
-        end
-        writefile(HOP_FLAG, on and "1" or "0")
-    end)
-end
-
-local function readHopFlag()
-    local ok, text = pcall(function()
-        return isfile and isfile(HOP_FLAG) and readfile(HOP_FLAG)
-    end)
-    return ok and text == "1"
-end
-
-local function validHopUrl(url)
-    return type(url) == "string" and url:match("^https://[%w%._%-/%%?=&:~]+$") ~= nil
-end
-
-local function pickServer()
-    local ok, body = pcall(function()
-        return game:HttpGet(string.format(
-            "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100",
-            game.PlaceId
-        ))
-    end)
-    if not ok or type(body) ~= "string" then
-        return nil
-    end
-    local okJson, data = pcall(function()
-        return HttpService:JSONDecode(body)
-    end)
-    if not okJson or type(data) ~= "table" or type(data.data) ~= "table" then
-        return nil
-    end
-    local pool = {}
-    for _, server in ipairs(data.data) do
-        if server.id ~= game.JobId and server.playing and server.maxPlayers and server.playing < server.maxPlayers - 1 then
-            table.insert(pool, server.id)
-        end
-    end
-    if #pool == 0 then
-        return nil
-    end
-    return pool[math.random(#pool)]
-end
-
-local function doHop()
-    if Hop.busy then
-        return
-    end
-    Hop.busy = true
-    Hop.lastStatus = "looking for a server"
-    local id = pickServer()
-    if not id then
-        Hop.lastStatus = "no server found, retrying"
-        Hop.startedAt = os.clock() - Hop.settle + 20
-        Hop.busy = false
-        return
-    end
-
-    local queue = getgenv().queue_on_teleport or (getgenv().syn and getgenv().syn.queue_on_teleport)
-    if type(queue) == "function" and validHopUrl(Hop.url) then
-        pcall(queue, string.format('loadstring(game:HttpGet("%s"))()', Hop.url))
-    end
-
-    Hop.hops = Hop.hops + 1
-    Hop.lastStatus = "hopping"
-    webhook("Server hop #" .. Hop.hops .. ": no wanted rare item here")
-    pcall(function()
-        TeleportService:TeleportToPlaceInstance(game.PlaceId, id, LocalPlayer)
-    end)
-    task.wait(20)
-    -- still here, so the teleport did not go through
-    Hop.startedAt = os.clock() - Hop.settle + 10
-    Hop.busy = false
-end
-
-local function hopCycle()
-    if not Hop.enabled or Hop.busy then
-        return
-    end
-    if not Shop.rare then
-        Hop.lastStatus = "turn on Auto buy rare first"
-        return
-    end
-    if not validHopUrl(Hop.url) then
-        Hop.lastStatus = "set the raw script URL first"
-        return
-    end
-    if os.clock() - Hop.startedAt < Hop.settle then
-        Hop.lastStatus = "checking this server"
-        return
-    end
-    local s = snap()
-    if not s then
-        return
-    end
-    if Lock.holder == "shop" or #rareJobs(s) > 0 then
-        Hop.lastStatus = "buying here"
-        Hop.startedAt = math.max(Hop.startedAt, os.clock() - Hop.settle + 8)
-        return
-    end
-    doHop()
-end
-
----------------------------------------------------------------------
--- auto buff (warung food)
---   the server only accepts "eat" while you stand at the warung, so the
---   hub travels there, eats and travels back
----------------------------------------------------------------------
-
-local BUFF_WARUNGS = {
-    { id = "esteh", label = "Es Teh Segar", effect = "cooking 60% faster" },
-    { id = "kopi", label = "Warung Kopi", effect = "walk 35% faster" },
-    { id = "bakso", label = "Bakso Mas Tono", effect = "PC repair 60% faster" },
-    { id = "padang", label = "Nasi Padang", effect = "XP +30%" },
-}
-
-local Buff = { on = {}, item = {}, itemNames = {}, below = 20, bought = 0, last = "-" }
-
-local function warungMinutes(itemId)
-    local map = GameConfig and GameConfig.WARUNG_MINUTES
-    return (map and map[itemId]) or (LifeData and LifeData.BUFF_MINUTES) or 240
-end
-
-if LifeData and LifeData.WARUNGS then
-    for _, w in ipairs(BUFF_WARUNGS) do
-        local data = LifeData.WARUNGS[w.id]
-        Buff.on[w.id] = false
-        Buff.itemNames[w.id] = {}
-        if data then
-            local best
-            for _, item in ipairs(data.items) do
-                local label = string.format("%s (%s)", item.name, fmt(item.price))
-                Buff.itemNames[w.id][label] = item.id
-                if not best or warungMinutes(item.id) > warungMinutes(best) then
-                    best = item.id
-                end
-            end
-            Buff.item[w.id] = best
-        end
-    end
-end
-
-local function buffEnabled()
-    for _, on in pairs(Buff.on) do
-        if on then
-            return true
-        end
-    end
-    return false
-end
-
-local function buffCycle()
-    local l = life()
-    local s = snap()
-    if not (l and s and Action and LifeData) then
-        return
-    end
-    local buffs = l.buffs or {}
-    for _, w in ipairs(BUFF_WARUNGS) do
-        local data = LifeData.WARUNGS and LifeData.WARUNGS[w.id]
-        local item = Buff.item[w.id]
-        if Buff.on[w.id] and data and item then
-            local buffId, price = nil, 0
-            for _, it in ipairs(data.items) do
-                if it.id == item then
-                    buffId = it.buff
-                    price = it.price
-                end
-            end
-            local remaining = buffId and buffs[buffId]
-            if (not remaining or remaining < Buff.below) and (s.money or 0) > price * 2 then
-                local door = findSpot("warung", w.id)
-                if door and acquire("buff", 120) then
-                    local root = getRoot()
-                    local home = root and root.Position
-                    Hub.status = "Getting a buff at " .. w.label
-                    if safeTeleport(frontOf(door, 5), { timeout = 45 }) then
-                        Action:FireServer("eat", { warung = w.id, item = item })
-                        Buff.bought = Buff.bought + 1
-                        Buff.last = w.label
-                        notifyT("Buff", w.label .. " - " .. w.effect, 4)
-                        webhook("Buff bought at **" .. w.label .. "** (" .. w.effect .. ")")
-                        task.wait(0.9)
-                    end
-                    if home then
-                        safeTeleport(home, { offset = 0, timeout = 45 })
-                    end
-                    release("buff")
-                    return
-                end
-            end
-        end
-    end
-end
-
-local function buffText()
-    local l = life()
-    local buffs = l and l.buffs or {}
-    local parts = {}
-    for id, remaining in pairs(buffs) do
-        local def = LifeData and LifeData.BUFFS and LifeData.BUFFS[id]
-        local minutes = tonumber(remaining) or 0
-        table.insert(parts, string.format("%s %dj %02dm", def and def.name or id, math.floor(minutes / 60), math.floor(minutes % 60)))
-    end
-    if #parts == 0 then
-        return "none"
-    end
-    return table.concat(parts, "  |  ")
-end
-
----------------------------------------------------------------------
--- dashboard text, alerts
----------------------------------------------------------------------
-
-local startMoney, startClock, lastDay = nil, os.clock(), nil
-
-local function statsText(s)
-    local today = s.today or {}
-    local inc = today.income or {}
-    local total = 0
-    for _, v in pairs(inc) do
-        total = total + v
-    end
-    local rating = (today.ratingN and today.ratingN > 0) and (today.ratingSum / today.ratingN) or s.rep or 0
-    local active = 0
-    for _, ses in pairs(s.sessions or {}) do
-        if ses.playing then
-            active = active + 1
-        end
-    end
-    local food = {}
-    for _, key in ipairs(FOOD_ORDER) do
-        table.insert(food, string.format("%s %s", FOOD_NAMES[key], tostring(s.stock and s.stock[key] or "?")))
-    end
-    local nextShop = s.shops and s.shops.next or 0
-    local mins = (os.clock() - startClock) / 60
-    local gained = (startMoney and s.money) and (s.money - startMoney) or 0
-    return table.concat({
-        string.format("Day %s  |  Cash %s  |  Rating %.2f", tostring(s.day), fmt(s.money), rating),
-        string.format("Customers %s  |  Served %s  |  Angry %s", tostring(today.customers), tostring(today.served), tostring(today.angry)),
-        string.format("Income today %s  (Billing %s | Food %s | Tips %s)", fmt(total), fmt(inc.billing or 0), fmt(inc.food or 0), fmt(inc.tip or 0)),
-        string.format("Spent on purchases today %s", fmt((today.expense and today.expense.purchases) or 0)),
-        string.format("Active sessions %d  |  Queue %d", active, #(s.queue or {})),
-        "Stock: " .. table.concat(food, "  "),
-        "Buffs: " .. buffText(),
-        string.format("Shop restock in %02d:%02d", math.floor(nextShop / 60), math.floor(nextShop % 60)),
-        string.format("This session %s  (%s / hour)", fmt(gained), fmt(mins > 0.5 and gained / mins * 60 or 0)),
-    }, "\n")
-end
-
-local function countRareInStock(s)
-    local n = 0
-    local shelves = s.shops and s.shops.shelves or {}
-    for _, items in pairs(shelves) do
-        for id, stock in pairs(items) do
-            local it = BY_ID[id]
-            if stock > 0 and it and it.town and it.rarity ~= "biasa" then
-                n = n + stock
-            end
-        end
-    end
-    return n
-end
-
-local summaryConn
-if DayReportEvent then
-    summaryConn = DayReportEvent.OnClientEvent:Connect(function()
-        if not Alerts.dayWebhook then
-            return
-        end
-        task.delay(0.5, function()
-            local s = snap()
-            if s then
-                webhook("```\n" .. statsText(s) .. "\n```")
-            end
-        end)
-    end)
-end
-
-local PerfState = {}
-
----------------------------------------------------------------------
--- Main: warnet
----------------------------------------------------------------------
-
-local gFarm = Tabs.Main:AddGroupbox({
-    Side = "Left",
-    Name = "Warnet",
-    IconName = "store",
-})
-
-gFarm:AddToggle("FarmKeepOpen", {
-    Text = "Keep warnet open",
-    Default = false,
-    Tooltip = "Opens the warnet whenever it is closed.",
-    Callback = function(value)
-        Farm.keepOpen = value
-    end,
-})
-
-gFarm:AddToggle("FarmServe", {
-    Text = "Auto serve customers",
-    Default = false,
-    Tooltip = "Travels to every waiting customer and seats them.",
-    Callback = function(value)
-        Farm.serve = value
-    end,
-})
-
-gFarm:AddToggle("FarmDeliver", {
-    Text = "Auto deliver food",
-    Default = false,
-    Tooltip = "Hands over food orders to customers.",
-    Callback = function(value)
-        Farm.deliver = value
-    end,
-})
-
-gFarm:AddToggle("FarmCook", {
-    Text = "Auto cook",
-    Default = false,
-    Tooltip = "Cooks a menu item while its stock is below the slider.",
-    Callback = function(value)
-        Farm.cook = value
-    end,
-})
-
-gFarm:AddSlider("FarmCookBelow", {
-    Text = "Cook when stock below",
-    Default = 6,
-    Min = 1,
-    Max = 40,
-    Rounding = 0,
-    Callback = function(value)
-        Farm.cookBelow = value
-    end,
-})
-
-gFarm:AddToggle("FarmClean", {
-    Text = "Auto clean trash",
-    Default = false,
-    Callback = function(value)
-        Farm.clean = value
-    end,
-})
-
-gFarm:AddToggle("FarmRepair", {
-    Text = "Auto repair stations",
-    Default = false,
-    Callback = function(value)
-        Farm.repair = value
-    end,
-})
-
-gFarm:AddToggle("FarmLike", {
-    Text = "Auto like sign",
-    Default = false,
-    Tooltip = "Fires the like sign every 45 seconds.",
-    Callback = function(value)
-        Farm.like = value
-    end,
-})
-
-gFarm:AddToggle("FarmDayReport", {
-    Text = "Auto close day report",
-    Default = false,
-    Tooltip = "Dismisses the end of day report so it never blocks the farm.",
-    Callback = function(value)
-        Farm.dayReport = value
-    end,
-})
-
-gFarm:AddDivider()
-
-local farmLabel = gFarm:AddLabel("FarmStatus", {
-    Text = "Served 0 • Cleaned 0 • Repaired 0 • Cooked 0",
-})
-
----------------------------------------------------------------------
--- Main: quest
----------------------------------------------------------------------
-
-local gQuest = Tabs.Main:AddGroupbox({
-    Side = "Left",
-    Name = "Auto Quest",
-    IconName = "scroll-text",
-})
-
-gQuest:AddToggle("QuestAuto", {
-    Text = "Auto quest",
-    Default = false,
-    Tooltip = "Accepts offers and finishes them: deliver, fetch and the runaway cat.",
-    Callback = function(value)
-        Quest.enabled = value
-    end,
-})
-
-gQuest:AddDropdown("QuestTypes", {
-    Values = { "Deliver", "Fetch", "Cat" },
-    Default = { "Deliver", "Fetch", "Cat" },
-    Multi = true,
-    Text = "Quest types",
-    Callback = function(values)
-        Quest.types = {
-            deliver = values.Deliver == true,
-            fetch = values.Fetch == true,
-            cat = values.Cat == true,
-        }
-    end,
-})
-
-gQuest:AddDivider()
-
-local questLabel = gQuest:AddLabel("QuestStatus", {
-    Text = "Idle",
-})
-
----------------------------------------------------------------------
--- Main: collect
----------------------------------------------------------------------
-
-local gCollect = Tabs.Main:AddGroupbox({
-    Side = "Right",
-    Name = "Collect",
-    IconName = "gift",
-})
-
-gCollect:AddToggle("CollectGifts", {
-    Text = "Auto claim gifts",
-    Default = false,
-    Tooltip = "Grabs every gift that spawns on the streets.",
-    Callback = function(value)
-        Collect.gifts = value
-    end,
-})
-
-gCollect:AddToggle("CollectCards", {
-    Text = "Auto claim rare cards",
-    Default = false,
-    Tooltip = "Grabs every rare card that spawns in the world.",
-    Callback = function(value)
-        Collect.cards = value
-    end,
-})
-
-gCollect:AddDivider()
-
-local collectLabel = gCollect:AddLabel("CollectStatus", {
-    Text = "Gifts 0 • Cards 0",
-})
-
----------------------------------------------------------------------
--- Main: movement
----------------------------------------------------------------------
-
-local gMove = Tabs.Main:AddGroupbox({
-    Side = "Right",
-    Name = "Movement",
-    IconName = "move",
-})
-
-gMove:AddSlider("TravelSpeed", {
-    Text = "Travel speed (auto trips)",
-    Default = 20,
-    Min = 10,
-    Max = 24,
-    Rounding = 0,
-    Suffix = " st/s",
-    Tooltip = "Speed of the tween used by every auto trip. 20 had zero rubber banding in testing; 25 and up did not.",
-    Callback = function(value)
-        Travel.speed = value
-    end,
-})
-
-gMove:AddToggle("MoveSpeed", {
-    Text = "Speed boost",
-    Default = false,
-    Tooltip = "Re-applies WalkSpeed every frame while on, and restores it when off.",
-    Callback = function(value)
-        Speed.enabled = value
-        if not value then
-            dropSpeed()
-        end
-    end,
-})
-
-gMove:AddSlider("SpeedValue", {
-    Text = "Speed",
-    Default = 60,
-    Min = 16,
-    Max = 60,
-    Rounding = 0,
-    Tooltip = "The game reverts anything above roughly 60 studs/s, so the slider stops there.",
-    Callback = function(value)
-        Speed.value = value
-    end,
-})
-
-gMove:AddToggle("MoveFly", {
-    Text = "Fly",
-    Default = false,
-    Tooltip = "Space = up, Left Ctrl = down.",
-    Callback = function(value)
-        Fly.enabled = value
-        if not value then
-            dropFly()
-        end
-    end,
-})
-
-gMove:AddSlider("FlyValue", {
-    Text = "Fly speed",
-    Default = 50,
-    Min = 20,
-    Max = 55,
-    Rounding = 0,
-    Callback = function(value)
-        Fly.speed = value
-    end,
-})
-
-gMove:AddToggle("MoveNoclip", {
-    Text = "Noclip",
-    Default = false,
-    Tooltip = "Trips already use noclip automatically. This keeps it on all the time.",
-    Callback = function(value)
-        Misc.noclip = value
-    end,
-})
-
-gMove:AddToggle("MoveInfJump", {
-    Text = "Infinite jump",
-    Default = false,
-    Callback = function(value)
-        Misc.infJump = value
-    end,
-})
-
-gMove:AddToggle("MoveAntiAfk", {
-    Text = "Anti AFK",
-    Default = false,
-    Callback = function(value)
-        Misc.antiAfk = value
-    end,
-})
-
----------------------------------------------------------------------
--- Shop tab: auto buy rare
----------------------------------------------------------------------
-
-local gRare = Tabs.Shop:AddGroupbox({
-    Side = "Left",
-    Name = "Auto Buy Rare",
-    IconName = "gem",
-})
-
-gRare:AddToggle("ShopRare", {
-    Text = "Auto buy rare items",
-    Default = false,
-    Tooltip = "Buys rare items as soon as a town shop stocks them.",
-    Callback = function(value)
-        Shop.rare = value
-    end,
-})
-
-gRare:AddDropdown("ShopMinTier", {
-    Values = TIERS,
-    Default = TIERS[1],
-    Text = "Minimum tier",
-    Callback = function(value)
-        for i, name in ipairs(TIERS) do
-            if name == value then
-                Shop.minTier = i
-            end
-        end
-    end,
-})
-
-gRare:AddDropdown("ShopRarity", {
-    Values = RARITY_NAMES,
-    Default = RARITY_NAMES,
-    Multi = true,
-    Text = "Rarity filter",
-    Callback = function(values)
-        local set = {}
-        for label, key in pairs(RARITY_KEYS) do
-            set[key] = values[label] == true
-        end
-        Shop.rarity = set
-    end,
-})
-
-gRare:AddDropdown("ShopStores", {
-    Values = SHOP_STORE_NAMES,
-    Default = SHOP_STORE_NAMES,
-    Multi = true,
-    Text = "Target stores",
-    Callback = function(values)
-        local set = {}
-        for label, key in pairs(SHOP_STORES) do
-            set[key] = values[label] == true
-        end
-        Shop.stores = set
-    end,
-})
-
-gRare:AddDropdown("ShopCategories", {
-    Values = CATEGORIES,
-    Default = {},
-    Multi = true,
-    Text = "Category filter (empty = all)",
-    Callback = function(values)
-        local set = {}
-        for label, on in pairs(values) do
-            if on == true then
-                set[label] = true
-            end
-        end
-        Shop.cats = set
-    end,
-})
-
-gRare:AddSlider("ShopMaxPrice", {
-    Text = "Max price per item (0 = no limit)",
-    Default = 0,
-    Min = 0,
-    Max = 20,
-    Rounding = 1,
-    Suffix = " jt",
-    Callback = function(value)
-        Shop.maxPrice = value
-    end,
-})
-
-gRare:AddSlider("ShopPerItem", {
-    Text = "Max bought per item",
-    Default = 3,
-    Min = 1,
-    Max = 20,
-    Rounding = 0,
-    Callback = function(value)
-        Shop.perItem = value
-    end,
-})
-
-gRare:AddSlider("ShopReserve", {
-    Text = "Keep cash reserve",
-    Default = 5,
-    Min = 0,
-    Max = 100,
-    Rounding = 0,
-    Suffix = " jt",
-    Callback = function(value)
-        Shop.reserve = value
-    end,
-})
-
-gRare:AddButton({
-    Text = "Scan & buy now",
-    Func = function()
-        local s = snap()
-        if not s then
-            return
-        end
-        local jobs = rareJobs(s)
-        if #jobs == 0 then
-            notify("No matching rare item in stock right now.")
-            return
-        end
-        task.spawn(runJobs, jobs, 5)
-    end,
-})
-
----------------------------------------------------------------------
--- Shop tab: server hop
----------------------------------------------------------------------
-
-local gHop = Tabs.Shop:AddGroupbox({
-    Side = "Right",
-    Name = "Server Hop (rare hunting)",
-    IconName = "globe",
-})
-
-gHop:AddToggle("HopRare", {
-    Text = "Hop servers until a rare item shows",
-    Default = false,
-    Tooltip = "Needs Auto buy rare on and the script URL below. Each server has its own shop stock.",
-    Callback = function(value)
-        Hop.enabled = value
-        Hop.startedAt = os.clock()
-        writeHopFlag(value)
-    end,
-})
-
-gHop:AddInput("HopUrl", {
-    Default = "",
-    Text = "Raw script URL (runs again after a hop)",
-    Placeholder = "https://raw.githubusercontent.com/you/repo/main/SikatHub.luau",
-    Callback = function(value)
-        Hop.url = tostring(value or "")
-    end,
-})
-
-gHop:AddSlider("HopSettle", {
-    Text = "Check each server for (seconds)",
-    Default = 20,
-    Min = 10,
-    Max = 60,
-    Rounding = 0,
-    Callback = function(value)
-        Hop.settle = value
-    end,
-})
-
-gHop:AddButton({
-    Text = "Hop now",
-    Func = function()
-        if not validHopUrl(Hop.url) then
-            notify("Set the raw script URL first, so the hub reloads after the hop.")
-            return
-        end
-        task.spawn(doHop)
-    end,
-})
-
-local hopLabel = gHop:AddLabel("HopStatus", {
-    Text = "Hop: off",
-    DoesWrap = true,
-})
-
----------------------------------------------------------------------
--- Shop tab: minimart
----------------------------------------------------------------------
-
-local gMart = Tabs.Shop:AddGroupbox({
-    Side = "Right",
-    Name = "Minimart 24",
-    IconName = "store",
-})
-
-gMart:AddToggle("ShopRestock", {
-    Text = "Auto restock cafe",
-    Default = false,
-    Tooltip = "Buys an ingredient when its cafe stock falls below the limit.",
-    Callback = function(value)
-        Shop.restock = value
-    end,
-})
-
-gMart:AddSlider("ShopRestockBelow", {
-    Text = "Restock when stock below",
-    Default = 10,
-    Min = 1,
-    Max = 100,
-    Rounding = 0,
-    Callback = function(value)
-        Shop.restockBelow = value
-    end,
-})
-
-gMart:AddToggle("ShopBorong", {
-    Text = "Auto borong (fill every ingredient)",
-    Default = false,
-    Tooltip = "Buys Minimart stock whenever the cafe has room (cap 100 per ingredient).",
-    Callback = function(value)
-        Shop.borong = value
-    end,
-})
-
-gMart:AddButton({
-    Text = "Restock low items now",
-    Func = function()
-        local s = snap()
-        if s then
-            task.spawn(runJobs, minimartJobs(s, true), 4)
-        end
-    end,
-})
-
-local gShopLog = Tabs.Shop:AddGroupbox({
-    Side = "Right",
-    Name = "Buy log",
-    IconName = "scroll-text",
-})
-
-local shopLabel = gShopLog:AddLabel("ShopStatus", {
-    Text = "Bought 0 items",
-    DoesWrap = true,
-})
-
----------------------------------------------------------------------
--- Shop tab: buffs
----------------------------------------------------------------------
-
-local gBuff = Tabs.Shop:AddGroupbox({
-    Side = "Left",
-    Name = "Auto Buff",
-    IconName = "zap",
-})
-
-for _, w in ipairs(BUFF_WARUNGS) do
-    local names = {}
-    local default
-    for label, itemId in pairs(Buff.itemNames[w.id] or {}) do
-        table.insert(names, label)
-        if itemId == Buff.item[w.id] then
-            default = label
-        end
-    end
-    table.sort(names)
-    if #names > 0 then
-        gBuff:AddToggle("Buff_" .. w.id, {
-            Text = w.label .. " (" .. w.effect .. ")",
-            Default = false,
-            Callback = function(value)
-                Buff.on[w.id] = value
-            end,
-        })
-        gBuff:AddDropdown("BuffItem_" .. w.id, {
-            Values = names,
-            Default = default or names[1],
-            Text = w.label .. " item",
-            Callback = function(value)
-                local id = Buff.itemNames[w.id][value]
-                if id then
-                    Buff.item[w.id] = id
-                end
-            end,
-        })
-    end
-end
-
-gBuff:AddSlider("BuffBelow", {
-    Text = "Renew when less than (minutes)",
-    Default = 20,
-    Min = 1,
-    Max = 120,
-    Rounding = 0,
-    Callback = function(value)
-        Buff.below = value
-    end,
-})
-
-gBuff:AddDivider()
-
-local buffLabel = gBuff:AddLabel("BuffStatus", {
-    Text = "No buffs active",
-    DoesWrap = true,
-})
-
----------------------------------------------------------------------
--- Dashboard tab
----------------------------------------------------------------------
-
-local gStats = Tabs.Dashboard:AddGroupbox({
-    Side = "Left",
-    Name = "Warnet stats",
-    IconName = "bar-chart-3",
-})
-
-local statsLabel = gStats:AddLabel("DashStats", {
-    Text = "Loading...",
-    DoesWrap = true,
-})
-
-local gAlert = Tabs.Dashboard:AddGroupbox({
-    Side = "Right",
-    Name = "Alerts & Discord",
-    IconName = "bell",
-})
-
-gAlert:AddToggle("AlertLowStock", {
-    Text = "Low stock alert",
-    Default = false,
-    Callback = function(value)
-        Alerts.lowStock = value
-    end,
-})
-
-gAlert:AddSlider("AlertBelow", {
-    Text = "Alert when stock below",
-    Default = 10,
-    Min = 1,
-    Max = 100,
-    Rounding = 0,
-    Callback = function(value)
-        Alerts.below = value
-    end,
-})
-
-gAlert:AddToggle("AlertWebhook", {
-    Text = "Send events to Discord webhook",
-    Default = false,
-    Callback = function(value)
-        Alerts.webhookOn = value
-    end,
-})
-
-gAlert:AddInput("AlertWebhookUrl", {
-    Default = "",
-    Text = "Webhook URL",
-    Placeholder = "https://discord.com/api/webhooks/...",
-    Callback = function(value)
-        Alerts.webhookUrl = tostring(value or "")
-    end,
-})
-
-gAlert:AddButton({
-    Text = "Send test message",
-    Func = function()
-        webhook("Sikat Hub webhook test - connected as " .. LocalPlayer.Name)
-        notify("Webhook test sent (if the URL is valid).")
-    end,
-})
-
-gAlert:AddToggle("AlertDayWebhook", {
-    Text = "Post a summary after every day",
-    Default = false,
-    Callback = function(value)
-        Alerts.dayWebhook = value
-    end,
-})
-
----------------------------------------------------------------------
--- Utility: teleports
----------------------------------------------------------------------
-
-local STORES = {
-    { id = "computer", name = "Jaya Computer Store" },
-    { id = "furniture", name = "Teak Furniture (Mebel Jati)" },
-    { id = "decor", name = "Decoration Gallery" },
-    { id = "kitchen", name = "Cafe Equipment Store" },
-    { id = "minimart", name = "Minimart 24" },
-    { id = "home", name = "Rumah Idaman (home store)" },
-}
-
-local WARUNGS = {
-    { id = "bakso", name = "Bakso Mas Tono" },
-    { id = "kopi", name = "Warung Kopi" },
-    { id = "padang", name = "Nasi Padang" },
-    { id = "esteh", name = "Es Teh Segar" },
-}
-
-local function teleportTo(kind, id, label)
-    local part = findSpot(kind, id)
-    if not part then
-        notify("Could not find " .. tostring(label or id))
-        return
-    end
-    local target
-    if kind == "house" then
-        -- houses sit north of town and face the street (-Z)
-        target = part.Position + Vector3.new(0, 1, -5)
-    else
-        target = frontOf(part, 5)
-    end
-    Hub.status = "Traveling to " .. tostring(label or id)
-    if safeTeleport(target, { timeout = 45 }) then
-        notify("Arrived at " .. tostring(label or id))
-    else
-        notify("Trip to " .. tostring(label or id) .. " failed, try again")
-    end
-end
-
-local gStores = Tabs.Utility:AddGroupbox({
-    Side = "Left",
-    Name = "Stores",
-    IconName = "map-pin",
-})
-
-for _, store in ipairs(STORES) do
-    gStores:AddButton({
-        Text = store.name,
-        Func = function()
-            task.spawn(teleportTo, "store", store.id, store.name)
-        end,
-    })
-end
-
-local gWarung = Tabs.Utility:AddGroupbox({
-    Side = "Left",
-    Name = "Warungs",
-    IconName = "utensils",
-})
-
-for _, warung in ipairs(WARUNGS) do
-    gWarung:AddButton({
-        Text = warung.name,
-        Func = function()
-            task.spawn(teleportTo, "warung", warung.id, warung.name)
-        end,
-    })
-end
-
-local gTravel = Tabs.Utility:AddGroupbox({
-    Side = "Right",
-    Name = "Travel",
-    IconName = "navigation",
-})
-
-gTravel:AddButton({
-    Text = "My warnet",
-    Func = function()
-        task.spawn(function()
-            local lot = myLot()
-            local desk = lot and lot:FindFirstChild("Objects") and lot.Objects:FindFirstChild("operator_desk")
-            local target = desk and desk.Position or Vector3.new(0, 0, 0)
-            safeTeleport(target + Vector3.new(0, 0, 6), { timeout = 45 })
-        end)
-    end,
-})
-
-gTravel:AddButton({
-    Text = "Town centre",
-    Func = function()
-        task.spawn(safeTeleport, Vector3.new(0, 4, -20), { timeout = 45 })
-    end,
-})
-
-gTravel:AddButton({
-    Text = "Spawn",
-    Func = function()
-        local spawn = Workspace:FindFirstChild("SpawnLocation")
-        if spawn then
-            task.spawn(safeTeleport, spawn.Position, { timeout = 45 })
-        end
-    end,
-})
-
-gTravel:AddDivider()
-
-gTravel:AddButton({
-    Text = "Rejoin server",
-    Func = function()
-        pcall(function()
-            TeleportService:Teleport(game.PlaceId, LocalPlayer)
-        end)
-    end,
-})
-
-gTravel:AddButton({
-    Text = "Unload hub",
-    Func = function()
-        if Hub.unload then
-            Hub.unload()
-        end
-    end,
-})
-
----------------------------------------------------------------------
--- Utility: performance + shop tools
----------------------------------------------------------------------
-
-local gPerf = Tabs.Utility:AddGroupbox({
-    Side = "Right",
-    Name = "Performance",
-    IconName = "gauge",
-})
-
-gPerf:AddToggle("PerfNoRender", {
-    Text = "AFK saver (3D rendering off)",
-    Default = false,
-    Tooltip = "Turns 3D rendering off so a long farm session uses almost no GPU.",
-    Callback = function(value)
-        pcall(function()
-            RunService:Set3dRenderingEnabled(not value)
-        end)
-    end,
-})
-
-gPerf:AddToggle("PerfLowGfx", {
-    Text = "Low graphics",
-    Default = false,
-    Callback = function(value)
-        pcall(function()
-            if value then
-                if PerfState.shadows == nil then
-                    PerfState.shadows = Lighting.GlobalShadows
-                end
-                PerfState.quality = PerfState.quality or settings().Rendering.QualityLevel
-                Lighting.GlobalShadows = false
-                settings().Rendering.QualityLevel = Enum.QualityLevel.Level01
-            else
-                if PerfState.shadows ~= nil then
-                    Lighting.GlobalShadows = PerfState.shadows
-                end
-                if PerfState.quality then
-                    settings().Rendering.QualityLevel = PerfState.quality
-                end
-            end
-        end)
-    end,
-})
-
-gPerf:AddSlider("PerfFpsCap", {
-    Text = "FPS cap",
-    Default = 60,
-    Min = 15,
-    Max = 240,
-    Rounding = 0,
-    Callback = function(value)
-        local setcap = getgenv().setfpscap
-        if type(setcap) == "function" then
-            pcall(setcap, value)
-        end
-    end,
-})
-
-local gTools = Tabs.Utility:AddGroupbox({
-    Side = "Right",
-    Name = "Shop tools",
-    IconName = "wrench",
-})
-
-gTools:AddButton({
-    Text = "Fair prices for everything",
-    Func = function()
-        if Action then
-            Action:FireServer("priceFairAll", {})
-            notify("Fair prices applied.")
-        end
-    end,
-})
-
-gTools:AddToggle("ToolsAutoFair", {
-    Text = "Auto fair prices every new day",
-    Default = false,
-    Callback = function(value)
-        Alerts.autoFair = value
-    end,
-})
-
----------------------------------------------------------------------
--- UI Settings: menu key, floating button, config, theme
----------------------------------------------------------------------
-
-local gMenu = Tabs.Settings:AddGroupbox({
-    Side = "Left",
-    Name = "Menu",
-    IconName = "menu",
-})
-
-gMenu:AddLabel("Menu key"):AddKeyPicker("MenuKeybind", {
-    Default = "RightAlt",
-    NoUI = true,
-    Text = "Menu keybind",
-})
-Library.ToggleKeybind = Library.Options.MenuKeybind
-
-gMenu:AddToggle("FloatButton", {
-    Text = "Floating menu button",
-    Default = UserInputService.TouchEnabled,
-    Tooltip = "A draggable 'Menu' button that opens and closes this window. On by default on mobile.",
-    Callback = function(value)
-        Float.enabled = value
-        buildFloat()
-    end,
-})
-
-gMenu:AddButton({
-    Text = "Show / hide menu",
-    Func = toggleMenu,
-})
-
-gMenu:AddLabel("Default key: RightAlt. Click the key above to rebind it.", true)
-
-if SaveManager then
-    pcall(function()
-        SaveManager:SetLibrary(Library)
-        SaveManager:IgnoreThemeSettings()
-        SaveManager:SetIgnoreIndexes({ "MenuKeybind" })
-        SaveManager:SetFolder("SikatHub/Warnetopia")
-        SaveManager:BuildConfigSection(Tabs.Settings)
-        SaveManager:LoadAutoloadConfig()
-    end)
-end
-
-if ThemeManager then
-    pcall(function()
-        ThemeManager:SetLibrary(Library)
-        ThemeManager:SetFolder("SikatHub")
-        ThemeManager:ApplyToTab(Tabs.Settings)
-    end)
-end
-
--- a saved config may have flipped the floating button, so build it once the
--- final value is known
-Float.enabled = Library.Toggles.FloatButton and Library.Toggles.FloatButton.Value or Float.enabled
-buildFloat()
-
--- keep hopping after a server hop (the hub is run again by queue_on_teleport)
-if readHopFlag() then
-    pcall(function()
-        Library.Toggles.ShopRare:SetValue(true)
-        Library.Toggles.HopRare:SetValue(true)
-    end)
-    Hop.enabled = true
-    Shop.rare = true
-    Hop.startedAt = os.clock()
-end
-
----------------------------------------------------------------------
--- runtime loops
----------------------------------------------------------------------
-
-local heartbeat = RunService.RenderStepped:Connect(function(dt)
-    -- fly
-    if Fly.enabled then
-        local root = getRoot()
-        local hum = getHum()
-        local camera = Workspace.CurrentCamera
-        if root and hum and camera then
-            if not Fly.savedSpeed then
-                Fly.savedSpeed = hum.WalkSpeed
-                hum.WalkSpeed = 0
-            end
-
-            local move = Vector3.zero
-            if UserInputService:IsKeyDown(Enum.KeyCode.W) then
-                move += camera.CFrame.LookVector
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.S) then
-                move -= camera.CFrame.LookVector
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.A) then
-                move -= camera.CFrame.RightVector
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.D) then
-                move += camera.CFrame.RightVector
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
-                move += Vector3.new(0, 1, 0)
-            end
-            if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
-                move -= Vector3.new(0, 1, 0)
-            end
-
-            if move.Magnitude > 0 then
-                -- the server only accepts ~55 studs/s, so never ask for more
-                local speed = math.min(Fly.speed, 55)
-                local stepLength = speed * math.min(dt, 0.05)
-                root.CFrame = CFrame.new(root.Position + move.Unit * stepLength)
-            end
-            return
-        end
-    elseif Fly.savedSpeed then
-        local hum = getHum()
-        if hum then
-            hum.WalkSpeed = Fly.savedSpeed
-        end
-        Fly.savedSpeed = nil
-    end
-
-    if Speed.enabled and not Travel.active then
-        applySpeed()
-    end
-end)
-
--- noclip: always on while an auto trip is running, or when the toggle is on
-local stepped = RunService.Stepped:Connect(function()
-    if not (Misc.noclip or Travel.active) then
-        return
-    end
-    local char = getChar()
-    if not char then
-        return
-    end
-    for _, part in ipairs(char:GetDescendants()) do
-        if part:IsA("BasePart") and part.CanCollide then
-            part.CanCollide = false
-        end
-    end
-end)
-
-local jumpConn = UserInputService.JumpRequest:Connect(function()
-    if not Misc.infJump then
-        return
-    end
-    local hum = getHum()
-    if hum then
-        hum:ChangeState(Enum.HumanoidStateType.Jumping)
-    end
-end)
-
-local idleConn = LocalPlayer.Idled:Connect(function()
-    if not Misc.antiAfk then
-        return
-    end
-    pcall(function()
-        VirtualUser:CaptureController()
-        VirtualUser:ClickButton2(Vector2.new())
-    end)
-end)
-
--- warnet loop
-task.spawn(function()
-    while Hub.alive do
-        if farmEnabled() then
-            pcall(farmCycle)
-            task.wait(0.35)
-        else
-            task.wait(0.6)
-        end
-    end
-end)
-
--- quest loop
-task.spawn(function()
-    while Hub.alive do
-        if Quest.enabled then
-            pcall(questCycle)
-            task.wait(0.7)
-        else
-            task.wait(0.8)
-        end
-    end
-end)
-
--- collect loop
-task.spawn(function()
-    while Hub.alive do
-        if Collect.gifts or Collect.cards then
-            pcall(collectCycle)
-            task.wait(0.5)
-        else
-            task.wait(0.8)
-        end
-    end
-end)
-
--- shop loop
-task.spawn(function()
-    while Hub.alive do
-        if shopEnabled() then
-            pcall(shopCycle)
-            task.wait(1.2)
-        else
-            task.wait(1)
-        end
-    end
-end)
-
--- server hop loop
-task.spawn(function()
-    while Hub.alive do
-        if Hop.enabled then
-            pcall(hopCycle)
-        else
-            Hop.lastStatus = "off"
-        end
-        task.wait(2)
-    end
-end)
-
--- buff loop
-task.spawn(function()
-    while Hub.alive do
-        if buffEnabled() then
-            pcall(buffCycle)
-        end
-        task.wait(3)
-    end
-end)
-
--- stats loop
-task.spawn(function()
-    while Hub.alive do
-        pcall(function()
-            if farmLabel then
-                farmLabel:SetText(string.format(
-                    "Served %d • Delivered %d • Cleaned %d • Repaired %d • Cooked %d",
-                    Farm.served, Farm.delivered, Farm.cleaned, Farm.repaired, Farm.cooked
-                ))
-            end
-            if questLabel then
-                local l = life()
-                local active = l and l.active
-                local stage = active and tostring(active.stage) or "idle"
-                local name = active and tostring(active.name or "") or ""
-                questLabel:SetText(string.format("Stage: %s %s • accepted %d", stage, name, Quest.accepted))
-            end
-            if collectLabel then
-                collectLabel:SetText(string.format("Gifts %d • Cards %d", Collect.giftsClaimed, Collect.cardsClaimed))
-            end
-            if hopLabel then
-                hopLabel:SetText(string.format("Hop: %s • hops this run: %d", Hop.lastStatus, Hop.hops))
-            end
-
-            local s = snap()
-            if not s then
-                return
-            end
-            if s.money and not startMoney then
-                startMoney = s.money
-            end
-            if statsLabel then
-                statsLabel:SetText(statsText(s))
-            end
-            if shopLabel then
-                shopLabel:SetText(string.format(
-                    "Bought %d items (%s)\nLast: %s\nRare in stock now: %d",
-                    Shop.bought, fmt(Shop.spent), Shop.last, countRareInStock(s)
-                ))
-            end
-            if buffLabel then
-                buffLabel:SetText(string.format("Active: %s\nBought %d • last: %s", buffText(), Buff.bought, Buff.last))
-            end
-
-            if lastDay and s.day and s.day ~= lastDay and Alerts.autoFair and Action then
-                Action:FireServer("priceFairAll", {})
-            end
-            lastDay = s.day
-
-            if Alerts.lowStock then
-                for _, key in ipairs(FOOD_ORDER) do
-                    local have = s.stock and s.stock[key]
-                    if type(have) == "number" and have < Alerts.below and os.clock() - (Alerts.sent[key] or -999) > 120 then
-                        Alerts.sent[key] = os.clock()
-                        notifyT("Low stock", FOOD_NAMES[key] .. " is down to " .. have, 5)
-                        webhook(string.format("Low stock: **%s** is down to %d", FOOD_NAMES[key], have))
-                    end
-                end
-            end
-        end)
-        task.wait(1)
-    end
-end)
-
----------------------------------------------------------------------
--- scripting API (handy from the console, and used for testing)
----------------------------------------------------------------------
-
-Hub.api = {
-    teleport = teleportTo,
-    safeTeleport = safeTeleport,
-    travel = Travel,
-    farm = Farm,
-    quest = Quest,
-    collect = Collect,
-    shop = Shop,
-    buff = Buff,
-    hop = Hop,
-    speed = Speed,
-    fly = Fly,
-    misc = Misc,
-    toggleMenu = toggleMenu,
-    farmCycle = farmCycle,
-    questCycle = questCycle,
-    collectCycle = collectCycle,
-    shopCycle = shopCycle,
-    buffCycle = buffCycle,
-    hopCycle = hopCycle,
-    closeDayReport = closeDayReport,
-    firePrompt = firePrompt,
-}
-
----------------------------------------------------------------------
--- unload
----------------------------------------------------------------------
-
-Hub.unload = function()
-    Hub.alive = false
-    Travel.active = false
-    destroyFloat()
-    pcall(dropSpeed)
-    pcall(dropFly)
-    pcall(function()
-        RunService:Set3dRenderingEnabled(true)
-    end)
-    for _, c in ipairs({ heartbeat, stepped, jumpConn, idleConn, snapConn, dayConn, summaryConn }) do
-        pcall(function()
-            c:Disconnect()
-        end)
-    end
-    pcall(function()
-        Library:Unload()
-    end)
-    if getgenv().SikatHub == Hub then
-        getgenv().SikatHub = nil
-    end
-end
-
-Library:OnUnload(function()
-    Hub.alive = false
-    Travel.active = false
-    destroyFloat()
-    pcall(dropSpeed)
-    pcall(dropFly)
-    pcall(function()
-        RunService:Set3dRenderingEnabled(true)
-    end)
-end)
-
-notify("Sikat Hub v3.1 loaded. Menu key: RightAlt.")
+--[[ Protected by Lua Guard ]]
+
+( function (...) local Players = game:GetService("\080\108\097\121\101\114\115") local ReplicatedStorage = game:GetService("\082\101\112\108\105\099\097\116\101\100\083\116\111\114\097\103\101") local RunService = game:GetService("\082\117\110\083\101\114\118\105\099\101") local UserInputService = game:GetService("\085\115\101\114\073\110\112\117\116\083\101\114\118\105\099\101") local _lIIIlllllI = game:GetService("\087\111\114\107\115\112\097\099\101") local _IlllIIIlII = game:GetService("\086\105\114\116\117\097\108\085\115\101\114") local HttpService = game:GetService("\072\116\116\112\083\101\114\118\105\099\101") local Lighting = game:GetService("\076\105\103\104\116\105\110\103") local TweenService = game:GetService("\084\119\101\101\110\083\101\114\118\105\099\101") local TeleportService = game:GetService("\084\101\108\101\112\111\114\116\083\101\114\118\105\099\101") local _IIlIIIlllI = Players.LocalPlayer local _IlIllIIIIl = ReplicatedStorage:WaitForChild("\082\101\109\111\116\101\115", 0x1E) local _lllIIllllI = _IlIllIIIIl and _IlIllIIIIl:WaitForChild("\065\099\116\105\111\110", 0xF) local _IIIlIIIIlI = _IlIllIIIIl and _IlIllIIIIl:WaitForChild("\083\110\097\112\115\104\111\116", 0xF) local _IIlIIlIlII = _IlIllIIIIl and _IlIllIIIIl:WaitForChild("\068\097\121\082\101\112\111\114\116", 0xF) if getgenv().WarnetFarm and type(getgenv().WarnetFarm.stop) == "\102\117\110\099\116\105\111\110" then pcall(getgenv().WarnetFarm.stop) end
+ if getgenv().SikatHub and type(getgenv().SikatHub.unload) == "\102\117\110\099\116\105\111\110" then pcall(getgenv().SikatHub.unload) end
+ local _llIIIllIlI = { alive = true, _lIlIlIIlll = nil, _IIIIlIlIll = nil, status = "\083\116\097\114\116\105\110\103", } getgenv().SikatHub = _llIIIllIlI local _IIIIlIllIl = ReplicatedStorage:FindFirstChild("\083\104\097\114\101\100") local function _IIlIIllIlI(module) if not module then return nil end
+ local _IllllIIIII, res = pcall(require, module) if _IllllIIIII then return res end
+ return nil end
+ local _lIlIlIlllI = _IIlIIllIlI(_IIIIlIllIl and _IIIIlIllIl:FindFirstChild("\083\116\114\105\110\103\115")) local _lllllIIIlI = _IIlIIllIlI(_IIIIlIllIl and _IIIIlIllIl:FindFirstChild("\068\097\116\097") and _IIIIlIllIl.Data:FindFirstChild("\076\105\102\101")) local _IIlllllIll = _IIlIIllIlI(_IIIIlIllIl and _IIIIlIllIl:FindFirstChild("\068\097\116\097") and _IIIIlIllIl.Data:FindFirstChild("\067\097\116\097\108\111\103")) local _IIlllIlIIl = _IIlIIllIlI(_IIIIlIllIl and _IIIIlIllIl:FindFirstChild("\071\097\109\101\067\111\110\102\105\103")) local _IIlIllIlII = (_IIlllllIll and _IIlllllIll.BY_ID) or {} local _IIlIIlIIII = { lifeTake = "\084\097\107\101", pGift = "\071\105\102\116\033", pCard = "\082\097\114\101\032\099\097\114\100\033", pCat = "\084\104\101\032\114\117\110\097\119\097\121\032\111\114\097\110\103\101\032\099\097\116", lifeCatch = "\067\097\116\099\104", lifeTalk = "\084\097\108\107", pHandIn = "\072\097\110\100\032\111\118\101\114\032\116\111\032\123\110\097\109\101\125", nextDay = "\076\097\110\106\117\116\032\107\101\032\072\097\114\105\032\123\100\097\121\125", } local function _IIllIIllII(_IllllIIIll, vars) if _lIlIlIlllI and type(_lIlIlIlllI.t) == "\102\117\110\099\116\105\111\110" then local _IllllIIIII, res = pcall(_lIlIlIlllI.t, _IllllIIIll, vars) if _IllllIIIII and type(res) == "\115\116\114\105\110\103" then return res end
+ end
+ local _IllIllIIIl = _IIlIIlIIII[_IllllIIIll] or _IllllIIIll if vars then _IllIllIIIl = _IllIllIIIl:gsub("\123\040\037\119\043\041\125", function (_IIIIlIlIIl) return tostring(vars[_IIIIlIlIIl] or "") end
+ ) end
+ return _IllIllIIIl end
+ local function _lIIIlIIIlI(payload) if type(payload) ~= "\116\097\098\108\101" then return end
+ _llIIIllIlI.snap = payload if payload.life then _llIIIllIlI.life = payload.life end
+ end
+ local _IlIlllIlll if _IIIlIIIIlI then _IlIlllIlll = _IIIlIIIIlI.OnClientEvent:Connect(_lIIIlIIIlI) end
+ local function _lIlIlIIlll() return _llIIIllIlI.snap end
+ local function _IIIIlIlIll() return _llIIIllIlI.life or (_llIIIllIlI.snap and _llIIIllIlI.snap.life) end
+ local function _lllIlIIllI() return _IIlIIIlllI.Character end
+ local function _lIllIlIIIl() local _IllllIIIll = _lllIlIIllI() return _IllllIIIll and _IllllIIIll:FindFirstChild("\072\117\109\097\110\111\105\100\082\111\111\116\080\097\114\116") end
+ local function _lllIlIIIIl() local _IllllIIIll = _lllIlIIllI() return _IllllIIIll and _IllllIIIll:FindFirstChildOfClass("\072\117\109\097\110\111\105\100") end
+ local _IIIIIllIlI = { holder = nil, expires = 0x0 } local function _lIIIIlIlIl(_IIlIIIllIl, ttl) local _IIlIIlllII = os.clock() if _IIIIIllIlI.holder and _IIIIIllIlI.holder ~= _IIlIIIllIl and _IIlIIlllII < _IIIIIllIlI.expires then return false end
+ _IIIIIllIlI.holder = _IIlIIIllIl _IIIIIllIlI.expires = _IIlIIlllII + (ttl or 0x4) return true end
+ local function _IIllllllII(_IIlIIIllIl) if _IIIIIllIlI.holder == _IIlIIIllIl then _IIIIIllIlI.holder = nil _IIIIIllIlI.expires = 0x0 end
+ end
+ local _llllIlllIl = { _IllIlIIIll = 0x14, _llIIIlIIII = false } local function _lllIllIllI(pos, opts) opts = opts or {} local _IllIIlIIIl = opts.offset or 0x3 local _lIIIIIllIl = Vector3.new(pos.X, pos.Y + _IllIIlIIIl, pos.Z) local _lllIlllIII = opts.tolerance or 0x6 local _IIlllIllIl = os.clock() + (opts.timeout or 0x28) local _IIlIIIIlll = _lIllIlIIIl() if not _IIlIIIIlll or not _lllIlIIIIl() then return false end
+ local function _IIIllIIIlI(p) return (Vector2.new(p.X, p.Z) - Vector2.new(_lIIIIIllIl.X, _lIIIIIllIl.Z)).Magnitude end
+ if _IIIllIIIlI(_IIlIIIIlll.Position) <= 0x1E and math.abs(_IIlIIIIlll.Position.Y - _lIIIIIllIl.Y) <= 0x19 then _IIlIIIIlll.AssemblyLinearVelocity = Vector3.zero _IIlIIIIlll.CFrame = CFrame.new(_lIIIIIllIl) task.wait(0.2) _IIlIIIIlll = _lIllIlIIIl() if _IIlIIIIlll and _IIIllIIIlI(_IIlIIIIlll.Position) <= _lllIlllIII then return true end
+ end
+ local _IIIIllllll = 0x0 local _IlllllllIl = false _llllIlllIl.active = true while _IIIIllllll < 0x6 and os.clock() < _IIlllIllIl and _llIIIllIlI.alive do _IIIIllllll = _IIIIllllll + 0x1 _IIlIIIIlll = _lIllIlIIIl() if not _IIlIIIIlll then break end
+ local _IlllIllIII = _IIlIIIIlll.Position local _llIIIIIIIl = (_lIIIIIllIl - _IlllIllIII).Magnitude if _IIIllIIIlI(_IlllIllIII) <= _lllIlllIII then _IlllllllIl = true break end
+ local _IllIlIIIll = math.max(0x8, _llllIlllIl.speed * (0.85 ^ (_IIIIllllll - 0x1))) local _lIlIllIIIl = TweenService:Create( _IIlIIIIlll, TweenInfo.new(_llIIIIIIIl / _IllIlIIIll, Enum.EasingStyle.Linear), { CFrame = CFrame.new(_lIIIIIllIl) } ) local _IlllIllIIl = (_lIIIIIllIl - _IlllIllIII).Unit local _lIIllIlllI = 0x0 local _lllllllIII = false _lIlIllIIIl:Play() while _lIlIllIIIl.PlaybackState == Enum.PlaybackState.Playing and os.clock() < _IIlllIllIl and _llIIIllIlI.alive do _IIlIIIIlll = _lIllIlIIIl() if not _IIlIIIIlll then _lIlIllIIIl:Cancel() break end
+ _IIlIIIIlll.AssemblyLinearVelocity = Vector3.zero local _IllIllllll = (_IIlIIIIlll.Position - _IlllIllIII):Dot(_IlllIllIIl) if _IllIllllll < _lIIllIlllI - 0x6 then _lllllllIII = true _lIlIllIIIl:Cancel() break end
+ _lIIllIlllI = math.max(_lIIllIlllI, _IllIllllll) task.wait() end
+ _IIlIIIIlll = _lIllIlIIIl() if _IIlIIIIlll then _IIlIIIIlll.AssemblyLinearVelocity = Vector3.zero if not _lllllllIII and _IIIllIIIlI(_IIlIIIIlll.Position) <= _lllIlllIII then _IlllllllIl = true break end
+ end
+ task.wait(0.1) end
+ _llllIlllIl.active = false task.wait(0.1) return _IlllllllIl end
+ local function _IlIIIllIIl(_IllIIIIIlI) if not _IllIIIIIlI or not _IllIIIIIlI.Enabled then return false end
+ local _lIllIIlIII = getgenv().fireproximityprompt if type(_lIllIIlIII) == "\102\117\110\099\116\105\111\110" then local _IllllIIIII = pcall(_lIllIIlIII, _IllIIIIIlI) if _IllllIIIII then return true end
+ end
+ local _IllllIIIII = pcall( function () _IllIIIIIlI:InputHoldBegin() task.wait(math.max(_IllIIIIIlI.HoldDuration or 0x0, 0.05)) _IllIIIIIlI:InputHoldEnd() end
+ ) return _IllllIIIII end
+ local function _IlIllllIIl(_llIIllIIlI, _IllIIIIIlI, opts) if not _llIIllIIlI or not _IllIIIIIlI then return false end
+ if not _lllIllIllI(_llIIllIIlI.Position, opts) then return false end
+ return _IlIIIllIIl(_IllIIIIIlI) end
+ local function _lllIllllII() local _IIlIlIIllI = _lIIIlllllI:FindFirstChild("\077\097\112") return _IIlIlIIllI and _IIlIlIIllI:FindFirstChild("\076\111\116\115") end
+ local function _lllllllIlI() local _IIIIIllIlI = _lIlIlIIlll() local _IIIIIlIIll = (_IIIIIllIlI and _IIIIIllIlI.lot) or 0x2 local _IIlIllIlIl = _lllIllllII() return _IIlIllIlIl and _IIlIllIlIl:FindFirstChild("\076\111\116" .. tostring(_IIIIIlIIll)) end
+ local function _llIIIIIIll() local _IIlIlIIllI = _lIIIlllllI:FindFirstChild("\077\097\112") local _IIlIllllll = _IIlIlIIllI and _IIlIlIIllI:FindFirstChild("\084\111\119\110") return _IIlIllllll and _IIlIllllll:FindFirstChild("\083\112\111\116\115") end
+ local function _IlIllIlIlI(_lllllllIII, _IIlIIlllIl) local _lllllIIlll = _llIIIIIIll() if not _lllllIIlll then return nil end
+ for _, _llIIllIIlI in ipairs(_lllllIIlll:GetChildren()) do if _llIIllIIlI:GetAttribute("\075\105\110\100") == _lllllllIII and _llIIllIIlI:GetAttribute("\073\100") == _IIlIIlllIl then return _llIIllIIlI end
+ end
+ return nil end
+ local function _lIIlllIIII(_llIIllIIlI, _llIIIIIIIl) local _IIIIIlllIl = _llIIllIIlI.Position.Z > -0x19 and -0x1 or 0x1 return _llIIllIIlI.Position + Vector3.new(0x0, 0x1, (_llIIIIIIIl or 0x5) * _IIIIIlllIl) end
+ local function _lIIlIIllII(_llIlIlIlll, matcher) if not _llIlIlIlll then return nil end
+ local _llIIIIIlII for _, d in ipairs(_llIlIlIlll:GetDescendants()) do if d:IsA("\080\114\111\120\105\109\105\116\121\080\114\111\109\112\116") then if matcher and matcher(d) then if d.Enabled then return d end
+ _llIIIIIlII = _llIIIIIlII or d elseif not matcher then if d.Enabled then return d end
+ _llIIIIIlII = _llIIIIIlII or d end
+ end
+ end
+ return _llIIIIIlII end
+ local function _IlIIIIIlII(_IllIIIIIlI) if not _IllIIIIIlI then return nil end
+ local _lIlIIIlllI = _IllIIIIIlI.Parent if _lIlIIIlllI and _lIlIIIlllI:IsA("\066\097\115\101\080\097\114\116") then return _lIlIIIlllI end
+ if _lIlIIIlllI and _lIlIIIlllI:IsA("\077\111\100\101\108") then return _lIlIIIlllI.PrimaryPart or _lIlIIIlllI:FindFirstChildWhichIsA("\066\097\115\101\080\097\114\116") end
+ return nil end
+ local _IllIlIllll = { _lllllIIllI = false, value = 0x3C, original = nil } local function _lIllIlllll() local _IlIlIllllI = _lllIlIIIIl() if _IlIlIllllI and _IllIlIllll.original then _IlIlIllllI.WalkSpeed = _IllIlIllll.original end
+ _IllIlIllll.original = nil end
+ local function _lllIlIIIIl() local _IlIlIllllI = _lllIlIIIIl() if not _IlIlIllllI then return end
+ if _IllIlIllll.enabled then if not _IllIlIllll.original then _IllIlIllll.original = _IlIlIllllI.WalkSpeed end
+ _IlIlIllllI.WalkSpeed = _IllIlIllll.value end
+ end
+ local _lllIlIIIlI = { _lllllIIllI = false, _IllIlIIIll = 0x32, savedSpeed = nil } local function _IIIlIIIlIl() local _IlIlIllllI = _lllIlIIIIl() if _IlIlIllllI and _lllIlIIIlI.savedSpeed then _IlIlIllllI.WalkSpeed = _lllIlIIIlI.savedSpeed end
+ _lllIlIIIlI.savedSpeed = nil end
+ local _IllIlllIIl = { noclip = false, infJump = false, antiAfk = false } local _lIIllllIlI = { keepOpen = false, serve = false, deliver = false, cook = false, clean = false, repair = false, like = false, dayReport = false, cookBelow = 0x6, served = 0x0, delivered = 0x0, cleaned = 0x0, repaired = 0x0, cooked = 0x0, lastLike = 0x0, lastAction = "", } local _IllIlIlIIl = { { _IllllIIIll = "\109\105\101", _IIlIIlllIl = "\110\111\111\100\108\101" }, { _IllllIIIll = "\110\097\115\105", _IIlIIlllIl = "\114\105\099\101" }, { _IllllIIIll = "\115\111\100\097", _IIlIIlllIl = "\115\111\100\097" }, { _IllllIIIll = "\116\101\104", _IIlIIlllIl = "\116\101\097" }, { _IllllIIIll = "\107\111\112\105", _IIlIIlllIl = "\099\111\102\102\101\101" }, { _IllllIIIll = "\115\110\097\099\107", _IIlIIlllIl = "\115\110\097\099\107" }, } local function _IlIlIIIIll(_llllllIlIl) local _IIIIlIIlll = string.lower(_llllllIlIl or "") for _, entry in ipairs(_IllIlIlIIl) do if _IIIIlIIlll:find(entry.key, 0x1, true) then return entry.id end
+ end
+ return nil end
+ local function _IlIlIIIlII() return _lIIllllIlI.keepOpen or _lIIllllIlI.serve or _lIIllllIlI.deliver or _lIIllllIlI.cook or _lIIllllIlI.clean or _lIIllllIlI.repair or _lIIllllIlI.like end
+ local function _lllllllIII() local _lIlIlllIll = _lllllllIlI() if not _lIlIlllIll then return {} end
+ local _IlIlIllIlI = {} local _IlIIIlIlIl = _lIlIlllIll:FindFirstChild("\080\101\111\112\108\101") if _IlIIIlIlIl then for _, _llIlIlIlll in ipairs(_IlIIIlIlIl:GetChildren()) do local _IIlIIIIlll = _llIlIlIlll:FindFirstChild("\082\111\111\116") local _IllIIIIIlI = _IIlIIIIlll and _IIlIIIIlll:FindFirstChild("\080\114\111\109\112\116") if _IllIIIIIlI and _IllIIIIIlI:IsA("\080\114\111\120\105\109\105\116\121\080\114\111\109\112\116") and _IllIIIIIlI.Enabled then local _IlllIIllII = _IllIIIIIlI.ActionText or "" if _IlllIIllII == "\076\097\121\097\110\105" then table.insert(_IlIlIllIlI, { _lllllllIII = "\115\101\114\118\101", _IllIIIIIlI = _IllIIIIIlI, _llIIllIIlI = _IIlIIIIlll, _llIIlllllI = _llIlIlIlll.Name }) elseif string.sub(_IlllIIllII, 0x1, 0x5) == "\065\110\116\097\114" then table.insert(_IlIlIllIlI, { _lllllllIII = "\100\101\108\105\118\101\114", _IllIIIIIlI = _IllIIIIIlI, _llIIllIIlI = _IIlIIIIlll, _llIIlllllI = _llIlIlIlll.Name }) end
+ end
+ end
+ end
+ local _llIlIIIIll = _lIlIlllIll:FindFirstChild("\079\098\106\101\099\116\115") if _llIlIIIIll then for _, obj in ipairs(_llIlIIIIll:GetChildren()) do for _, d in ipairs(obj:GetDescendants()) do if d:IsA("\080\114\111\120\105\109\105\116\121\080\114\111\109\112\116") and d.Enabled then local _IlllIIllII = string.lower(d.ActionText or "") local _IIllIllIlI = string.lower(d.ObjectText or "") if _IlllIIllII:find("\098\101\114\115\105\104", 0x1, true) then table.insert(_IlIlIllIlI, { _lllllllIII = "\099\108\101\097\110", _IllIIIIIlI = d, _llIIllIIlI = obj }) elseif _IlllIIllII:find("\112\101\114\098\097\105\107\105", 0x1, true) or _IlllIIllII:find("\115\101\114\118\105\115", 0x1, true) or _IlllIIllII:find("\114\101\112\097\105\114", 0x1, true) or _IIllIllIlI:find("\114\117\115\097\107", 0x1, true) then table.insert(_IlIlIllIlI, { _lllllllIII = "\114\101\112\097\105\114", _IllIIIIIlI = d, _llIIllIIlI = obj }) elseif _IlllIIllII:find("\098\117\097\116\032", 0x1, true) then table.insert(_IlIlIllIlI, { _lllllllIII = "\099\111\111\107", _IllIIIIIlI = d, _llIIllIIlI = obj, _llllIIllIl = _IlIlIIIIll(_IlllIIllII) }) end
+ end
+ end
+ end
+ end
+ return _IlIlIllIlI end
+ local _lIIIllIlII = { serve = 0x1, deliver = 0x2, clean = 0x3, repair = 0x4, cook = 0x5 } local function _IIlIIIIlIl() local _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI then return end
+ if _lIIllllIlI.keepOpen and not _IIIIIllIlI.open then if _lllIIllllI then _lllIIllllI:FireServer("\115\101\116\079\112\101\110", { open = true }) _lIIllllIlI.lastAction = "\079\112\101\110\105\110\103\032\116\104\101\032\119\097\114\110\101\116" task.wait(0.6) end
+ return end
+ if not _IIIIIllIlI.open then return end
+ local _lIlllIIlll = _lllllllIII() table.sort(_lIlllIIlll, function (a, b) return (_lIIIllIlII[a.kind] or 0x9) < (_lIIIllIlII[b.kind] or 0x9) end
+ ) for _, _lllllIIllI in ipairs(_lIlllIIlll) do if not _llIIIllIlI.alive then return end
+ local _lllllIIllI = (_lllllIIllI.kind == "\115\101\114\118\101" and _lIIllllIlI.serve) or (_lllllIIllI.kind == "\100\101\108\105\118\101\114" and _lIIllllIlI.deliver) or (_lllllIIllI.kind == "\099\108\101\097\110" and _lIIllllIlI.clean) or (_lllllIIllI.kind == "\114\101\112\097\105\114" and _lIIllllIlI.repair) or (_lllllIIllI.kind == "\099\111\111\107" and _lIIllllIlI.cook) if _lllllIIllI then local _lllIlIIlIl = false if _lllllIIllI.kind == "\099\111\111\107" and _lllllIIllI.item then local _IlIIllllll = (_IIIIIllIlI.stock and _IIIIIllIlI.stock[_lllllIIllI.item]) or 0x0 if _IlIIllllll >= _lIIllllIlI.cookBelow then _lllIlIIlIl = true end
+ end
+ if not _lllIlIIlIl and _lIIIIlIlIl("\102\097\114\109", 0x6) then local _IllllIIIII = _IlIllllIIl(_lllllIIllI.part, _lllllIIllI.prompt) if _IllllIIIII then if _lllllIIllI.kind == "\115\101\114\118\101" then _lIIllllIlI.served = _lIIllllIlI.served + 0x1 _lIIllllIlI.lastAction = "\083\101\114\118\101\100\032" .. tostring(_lllllIIllI.label or "\099\117\115\116\111\109\101\114") elseif _lllllIIllI.kind == "\100\101\108\105\118\101\114" then _lIIllllIlI.delivered = _lIIllllIlI.delivered + 0x1 _lIIllllIlI.lastAction = "\068\101\108\105\118\101\114\101\100\032\116\111\032" .. tostring(_lllllIIllI.label or "\099\117\115\116\111\109\101\114") elseif _lllllIIllI.kind == "\099\108\101\097\110" then _lIIllllIlI.cleaned = _lIIllllIlI.cleaned + 0x1 _lIIllllIlI.lastAction = "\067\108\101\097\110\101\100\032\116\114\097\115\104" elseif _lllllIIllI.kind == "\114\101\112\097\105\114" then _lIIllllIlI.repaired = _lIIllllIlI.repaired + 0x1 _lIIllllIlI.lastAction = "\082\101\112\097\105\114\101\100\032\097\032\115\116\097\116\105\111\110" elseif _lllllIIllI.kind == "\099\111\111\107" then _lIIllllIlI.cooked = _lIIllllIlI.cooked + 0x1 _lIIllllIlI.lastAction = "\067\111\111\107\101\100\032" .. tostring(_lllllIIllI.item or "\102\111\111\100") end
+ end
+ _IIllllllII("\102\097\114\109") task.wait(0.12) end
+ end
+ end
+ if _lIIllllIlI.like and os.clock() - _lIIllllIlI.lastLike > 0x2D then local _lIlIlllIll = _lllllllIlI() local _IIlllIlllI = _lIlIlllIll and _lIlIlllIll:FindFirstChild("\083\104\101\108\108") local _IIlllIllIl = _IIlllIlllI and _IIlllIlllI:FindFirstChild("\076\105\107\101\083\105\103\110") local _IllIIIIIlI = _IIlllIllIl and _IIlllIllIl:FindFirstChild("\080\114\111\109\112\116") if _IllIIIIIlI and _IllIIIIIlI.Enabled and _lIIIIlIlIl("\102\097\114\109", 0x6) then if _IlIllllIIl(_IIlllIllIl, _IllIIIIIlI) then _lIIllllIlI.lastLike = os.clock() _lIIllllIlI.lastAction = "\076\105\107\101\100\032\116\104\101\032\119\097\114\110\101\116" end
+ _IIllllllII("\102\097\114\109") end
+ end
+ end
+ local _lIIllIIIll = { _lllllIIllI = false, types = { deliver = true, fetch = true, cat = true }, accepted = 0x0, _llIlIlIIll = "\105\100\108\101", lastId = nil, lastTry = 0x0, } local function _lIllIllllI(_IllIlIIlIl) local _lllllllIII = string.lower(tostring(_IllIlIIlIl and _IllIlIIlIl.type or "")) if _lllllllIII:find("\099\097\116", 0x1, true) or _lllllllIII:find("\107\117\099\105\110\103", 0x1, true) then return "\099\097\116" end
+ if _lllllllIII:find("\102\101\116\099\104", 0x1, true) or _lllllllIII:find("\098\117\121", 0x1, true) or _lllllllIII:find("\105\116\101\109", 0x1, true) or _lllllllIII:find("\098\101\108\105", 0x1, true) then return "\102\101\116\099\104" end
+ return "\100\101\108\105\118\101\114" end
+ local function _IIllllllII(offers) if type(offers) ~= "\116\097\098\108\101" then return nil end
+ local _lllllIIlII, bestReward = nil, -math.huge for _, _IllIlIIlIl in ipairs(offers) do if type(_IllIlIIlIl) == "\116\097\098\108\101" and _IllIlIIlIl.id and _lIIllIIIll.types[_lIllIllllI(_IllIlIIlIl)] then local _IlIlIIllII = (_IllIlIIlIl.reward and _IllIlIIlIl.reward.money) or 0x0 if _IlIlIIllII > bestReward then _lllllIIlII = _IllIlIIlIl bestReward = _IlIlIIllII end
+ end
+ end
+ return _lllllIIlII end
+ local function _llIlllIIIl() local _lllllIIlll = _llIIIIIIll() if not _lllllIIlll then return nil end
+ for _, _llIIllIIlI in ipairs(_lllllIIlll:GetChildren()) do if _llIIllIIlI:GetAttribute("\075\105\110\100") == "\104\111\117\115\101" then local _IllIIIIIlI = _llIIllIIlI:FindFirstChild("\080\114\111\109\112\116") if _IllIIIIIlI and _IllIIIIIlI:IsA("\080\114\111\120\105\109\105\116\121\080\114\111\109\112\116") and _IllIIIIIlI.Enabled then return _IllIIIIIlI, _llIIllIIlI end
+ end
+ end
+ return nil end
+ local function _IllIlllIIl(_IIlIIIllIl) local _llllIlIIll = _lIIIlllllI:FindFirstChild("\067\108\105\101\110\116\076\105\102\101") if not _llllIlIIll or not _IIlIIIllIl then return nil end
+ local _llIlIlIlll = _llllIlIIll:FindFirstChild(_IIlIIIllIl) if not _llIlIlIlll then for _, child in ipairs(_llllIlIIll:GetChildren()) do if string.find(string.lower(child.Name), string.lower(_IIlIIIllIl), 0x1, true) then _llIlIlIlll = child break end
+ end
+ end
+ if not _llIlIlIlll then return nil end
+ local _IllIIIIIlI = _lIIlIIllII(_llIlIlIlll) return _IllIIIIIlI, _IlIIIIIlII(_IllIIIIIlI) end
+ local function _llIIIlIIlI() local _llllIlIIll = _lIIIlllllI:FindFirstChild("\067\108\105\101\110\116\076\105\102\101") if not _llllIlIIll then return nil end
+ local _lllIIIllIl = string.lower(_IIllIIllII("\112\067\097\116")) for _, child in ipairs(_llllIlIIll:GetChildren()) do for _, d in ipairs(child:GetDescendants()) do if d:IsA("\080\114\111\120\105\109\105\116\121\080\114\111\109\112\116") then local _IIllIllIlI = string.lower(d.ObjectText or "") local _IlllIIllII = string.lower(d.ActionText or "") if d.Enabled and (_IIllIllIlI == _lllIIIllIl or _IIllIllIlI:find("\107\117\099\105\110\103", 0x1, true) or _IIllIllIlI:find("\099\097\116", 0x1, true) or _IlllIIllII:find("\116\097\110\103\107\097\112", 0x1, true) or _IlllIIllII:find("\099\097\116\099\104", 0x1, true)) then return d, _IlIIIIIlII(d) end
+ end
+ end
+ end
+ return nil end
+ local function _IIllIlIIIl() if not _lllIIllllI then return end
+ local _IIlIIllIII = _IIIIlIlIll() if not _IIlIIllIII then return end
+ local _llIIIlIIII = _IIlIIllIII.active if type(_llIIIlIIII) ~= "\116\097\098\108\101" then _lIIllIIIll.stage = "\105\100\108\101" local _IllIlIIlIl = _IIllllllII(_IIlIIllIII.offers) if _IllIlIIlIl and _IllIlIIlIl.id ~= _lIIllIIIll.lastId then _lllIIllllI:FireServer("\097\099\099\101\112\116", { _IIlIIlllIl = _IllIlIIlIl.id }) _lIIllIIIll.lastId = _IllIlIIlIl.id _lIIllIIIll.accepted = _lIIllIIIll.accepted + 0x1 _lIIllIIIll.stage = "\097\099\099\101\112\116\101\100" _llIIIllIlI.status = "\065\099\099\101\112\116\101\100\032\097\032\113\117\101\115\116" task.wait(0.8) end
+ return end
+ local _llIlIlIIll = tostring(_llIIIlIIII.stage or "") _lIIllIIIll.stage = _llIlIlIIll if _llIlIlIIll == "\114\101\116\117\114\110" then local _IllIIIIIlI, _llIIllIIlI = _IllIlllIIl(_llIIIlIIII.name) if _IllIIIIIlI and _llIIllIIlI and _lIIIIlIlIl("\113\117\101\115\116", 0x2D) then _IlIllllIIl(_llIIllIIlI, _IllIIIIIlI) _IIllllllII("\113\117\101\115\116") end
+ elseif _llIlIlIIll == "\100\101\108\105\118\101\114" then local _IllIIIIIlI, _llIIllIIlI = _llIlllIIIl() if _IllIIIIIlI and _llIIllIIlI and _lIIIIlIlIl("\113\117\101\115\116", 0x2D) then _IlIllllIIl(_llIIllIIlI, _IllIIIIIlI) _IIllllllII("\113\117\101\115\116") end
+ elseif _llIlIlIIll == "\098\117\121" then if _llIIIlIIII.item and _lIIIIlIlIl("\113\117\101\115\116", 0x3) then _lllIIllllI:FireServer("\113\117\101\115\116\066\117\121", { _llllIIllIl = _llIIIlIIII.item }) _IIllllllII("\113\117\101\115\116") task.wait(0.6) end
+ elseif _llIlIlIIll == "\102\105\110\100" then local _IllIIIIIlI, _llIIllIIlI = _llIIIlIIlI() if _IllIIIIIlI and _llIIllIIlI and _lIIIIlIlIl("\113\117\101\115\116", 0x2D) then _IlIllllIIl(_llIIllIIlI, _IllIIIIIlI) _IIllllllII("\113\117\101\115\116") end
+ end
+ end
+ local _llllIllIlI = { gifts = false, cards = false, giftsClaimed = 0x0, cardsClaimed = 0x0, } local function _IIlIIllIll(_llIlIlIlll, opts) if not _llIlIlIlll then return false end
+ local _IllIIIIIlI = _lIIlIIllII(_llIlIlIlll) if not _IllIIIIIlI or not _IllIIIIIlI.Enabled then return false end
+ local _llIIllIIlI = _IlIIIIIlII(_IllIIIIIlI) if not _llIIllIIlI then return false end
+ return _IlIllllIIl(_llIIllIIlI, _IllIIIIIlI, opts) end
+ local function _llIlllIlII() local _llllIlIIll = _lIIIlllllI:FindFirstChild("\067\108\105\101\110\116\076\105\102\101") if not _llllIlIIll then return end
+ if _llllIllIlI.gifts and _lIIIIlIlIl("\099\111\108\108\101\099\116", 0x2D) then local _llIlllIllI = _llllIlIIll:FindFirstChild("\071\105\102\116") if _llIlllIllI and _IIlIIllIll(_llIlllIllI) then _llllIllIlI.giftsClaimed = _llllIllIlI.giftsClaimed + 0x1 _llIIIllIlI.status = "\067\108\097\105\109\101\100\032\097\032\103\105\102\116" task.wait(0.4) end
+ _IIllllllII("\099\111\108\108\101\099\116") end
+ if _llllIllIlI.cards and _lIIIIlIlIl("\099\111\108\108\101\099\116", 0x2D) then local _lIllIIIIlI = _llllIlIIll:FindFirstChild("\082\097\114\101\067\097\114\100") if _lIllIIIIlI and _IIlIIllIll(_lIllIIIIlI) then _llllIllIlI.cardsClaimed = _llllIllIlI.cardsClaimed + 0x1 _llIIIllIlI.status = "\067\108\097\105\109\101\100\032\097\032\114\097\114\101\032\099\097\114\100" task.wait(0.4) end
+ _IIllllllII("\099\111\108\108\101\099\116") end
+ end
+ local function _IlIIllIIIl(_IlIIllIIlI) if not _IlIIllIIlI then return false end
+ local _IlIllIlllI = false local _IIllIlIlll = getgenv().getconnections if type(_IIllIlIlll) == "\102\117\110\099\116\105\111\110" then for _, signal in ipairs({ _IlIIllIIlI.MouseButton1Click, _IlIIllIIlI.Activated }) do local _IllllIIIII, conns = pcall(_IIllIlIlll, signal) if _IllllIIIII and type(conns) == "\116\097\098\108\101" then for _, conn in ipairs(conns) do if type(conn.Function) == "\102\117\110\099\116\105\111\110" then pcall(conn.Function) _IlIllIlllI = true end
+ end
+ end
+ end
+ end
+ if not _IlIllIlllI then local _IIlIllIlII = getgenv().firesignal if type(_IIlIllIlII) == "\102\117\110\099\116\105\111\110" then pcall(_IIlIllIlII, _IlIIllIIlI.MouseButton1Click) _IlIllIlllI = true end
+ end
+ return _IlIllIlllI end
+ local function _lIllIIIlII() local _IIIIIlIllI = _IIlIIIlllI:FindFirstChildOfClass("\080\108\097\121\101\114\071\117\105") if not _IIIIIlIllI then return false end
+ local _llIIIllIll = string.lower(string.gsub(_IIllIIllII("\110\101\120\116\068\097\121", { day = 0x1 }), "\037\100\043", "")) for _, d in ipairs(_IIIIIlIllI:GetDescendants()) do if d:IsA("\084\101\120\116\066\117\116\116\111\110") and d.Visible then local _llllllIlIl = string.lower(d.Text or "") if _llllllIlIl:find(_llIIIllIll, 0x1, true) or _llllllIlIl:find("\108\097\110\106\117\116", 0x1, true) or _llllllIlIl:find("\110\101\120\116\032\100\097\121", 0x1, true) then return _IlIIllIIIl(d) end
+ end
+ end
+ return false end
+ local _IIlIIIllll if _IIlIIlIlII then _IIlIIIllll = _IIlIIlIlII.OnClientEvent:Connect( function () if not _lIIllllIlI.dayReport then return end
+ task.delay(0x1, function () if _lIIllllIlI.dayReport then _lIllIIIlII() end
+ end
+ ) end
+ ) end
+ local _IlIIIIlIlI = "\104\116\116\112\115\058\047\047\114\097\119\046\103\105\116\104\117\098\117\115\101\114\099\111\110\116\101\110\116\046\099\111\109\047\100\101\105\118\105\100\099\111\109\115\111\110\111\047\079\098\115\105\100\105\097\110\047\109\097\105\110\047" local _llIIIlllII, Library = pcall( function () return loadstring(game:HttpGet(_IlIIIIlIlI .. "\076\105\098\114\097\114\121\046\108\117\097"))() end
+ ) if not _llIIIlllII or not Library then warn("\091\083\105\107\097\116\032\072\117\098\093\032\067\111\117\108\100\032\110\111\116\032\108\111\097\100\032\116\104\101\032\085\073\032\108\105\098\114\097\114\121\046") return end
+ local _IIIlIlllIl = select(0x2, pcall( function () return loadstring(game:HttpGet(_IlIIIIlIlI .. "\097\100\100\111\110\115\047\084\104\101\109\101\077\097\110\097\103\101\114\046\108\117\097"))() end
+ )) local _llIllIlIlI = select(0x2, pcall( function () return loadstring(game:HttpGet(_IlIIIIlIlI .. "\097\100\100\111\110\115\047\083\097\118\101\077\097\110\097\103\101\114\046\108\117\097"))() end
+ )) local _IllllIIIII = Library:CreateWindow({ Title = "\083\105\107\097\116\032\072\117\098", Footer = "\087\097\114\110\101\116\111\112\105\097\032\8226\032\118\051\046\049", NotifySide = "\082\105\103\104\116", ShowCustomCursor = true, }) local _IlIIllIIll = { Main = _IllllIIIII:AddTab("\077\097\105\110", "\104\111\109\101"), _lIlIlIlIlI = _IllllIIIII:AddTab("\083\104\111\112", "\115\104\111\112\112\105\110\103\045\099\097\114\116"), Dashboard = _IllllIIIII:AddTab("\068\097\115\104\098\111\097\114\100", "\108\097\121\111\117\116\045\100\097\115\104\098\111\097\114\100"), Utility = _IllllIIIII:AddTab("\085\116\105\108\105\116\121", "\119\114\101\110\099\104"), Settings = _IllllIIIII:AddTab("\085\073\032\083\101\116\116\105\110\103\115", "\115\101\116\116\105\110\103\115"), } local function _lIlllIlIll(_llllllIlIl) pcall( function () Library:Notify({ Title = "\083\105\107\097\116\032\072\117\098", Description = tostring(_llllllIlIl), Time = 0x3, }) end
+ ) end
+ local function _IlIIIIllIl() pcall( function () Library:Toggle() end
+ ) end
+ local _IIlIIIllll = { _lllllIIllI = UserInputService.TouchEnabled, _IIIIllIlll = nil, conns = {} } local function _IIlIIlIlll() for _, c in ipairs(_IIlIIIllll.conns) do pcall( function () c:Disconnect() end
+ ) end
+ _IIlIIIllll.conns = {} if _IIlIIIllll.gui then pcall( function () _IIlIIIllll.gui:Destroy() end
+ ) _IIlIIIllll.gui = nil end
+ end
+ local function _IlIIlIlIlI() _IIlIIlIlll() if not _IIlIIIllll.enabled or not _llIIIllIlI.alive then return end
+ local _lIlIIIlllI pcall( function () _lIlIIIlllI = getgenv().gethui and getgenv().gethui() end
+ ) _lIlIIIlllI = _lIlIIIlllI or game:GetService("\067\111\114\101\071\117\105") local _IIIIllIlll = Instance.new("\083\099\114\101\101\110\071\117\105") _IIIIllIlll.Name = "\083\105\107\097\116\077\101\110\117\066\117\116\116\111\110" _IIIIllIlll.ResetOnSpawn = false _IIIIllIlll.DisplayOrder = 0x3E8 _IIIIllIlll.IgnoreGuiInset = true _IIIIllIlll.Parent = _lIlIIIlllI local _IlIIllIIlI = Instance.new("\084\101\120\116\066\117\116\116\111\110") _IlIIllIIlI.Name = "\084\111\103\103\108\101" _IlIIllIIlI.Size = UDim2.fromOffset(0x48, 0x24) _IlIIllIIlI.Position = UDim2.new(0x0, 0xE, 0.5, -0x12) _IlIIllIIlI.AutoButtonColor = true _IlIIllIIlI.BackgroundColor3 = Color3.fromRGB(0x18, 0x18, 0x1E) _IlIIllIIlI.BackgroundTransparency = 0.1 _IlIIllIIlI.Text = "\077\101\110\117" _IlIIllIIlI.TextColor3 = Color3.fromRGB(0xF0, 0xF0, 0xF5) _IlIIllIIlI.TextSize = 0xF _IlIIllIIlI.Font = Enum.Font.GothamMedium _IlIIllIIlI.Parent = _IIIIllIlll local _IIIllIlIlI = Instance.new("\085\073\067\111\114\110\101\114") _IIIllIlIlI.CornerRadius = UDim.new(0x0, 0xA) _IIIllIlIlI.Parent = _IlIIllIIlI local _lIIllIllII = Instance.new("\085\073\083\116\114\111\107\101") _lIIllIllII.Color = Color3.fromRGB(0x5A, 0x5A, 0x6E) _lIIllIllII.Thickness = 0x1 _lIIllIllII.Parent = _IlIIllIIlI local _IIlIllIllI, moved = false, false local _IIlIIIlIll, startPos table.insert(_IIlIIIllll.conns, _IlIIllIIlI.InputBegan:Connect( function (input) if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then _IIlIllIllI = true moved = false _IIlIIIlIll = input.Position startPos = _IlIIllIIlI.Position end
+ end
+ )) table.insert(_IIlIIIllll.conns, UserInputService.InputChanged:Connect( function (input) if not _IIlIllIllI then return end
+ if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then local _IlIlIlIlIl = input.Position - _IIlIIIlIll if _IlIlIlIlIl.Magnitude > 0x6 then moved = true end
+ _IlIIllIIlI.Position = UDim2.new( startPos.X.Scale, startPos.X.Offset + _IlIlIlIlIl.X, startPos.Y.Scale, startPos.Y.Offset + _IlIlIlIlIl.Y ) end
+ end
+ )) table.insert(_IIlIIIllll.conns, UserInputService.InputEnded:Connect( function (input) if not _IIlIllIllI then return end
+ if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then _IIlIllIllI = false if not moved then _IlIIIIllIl() end
+ end
+ end
+ )) _IIlIIIllll.gui = _IIIIllIlll end
+ local _lIIlIllIII = 0x64 local _IIllllllII = { ["\084\111\107\111\032\075\111\109\112\117\116\101\114\032\074\097\121\097"] = "\099\111\109\112\117\116\101\114", ["\077\101\098\101\108\032\074\097\116\105"] = "\102\117\114\110\105\116\117\114\101", ["\071\097\108\101\114\105\032\068\101\107\111\114\097\115\105"] = "\100\101\099\111\114", ["\084\111\107\111\032\065\108\097\116\032\075\097\102\101"] = "\107\105\116\099\104\101\110", ["\082\117\109\097\104\032\073\100\097\109\097\110"] = "\104\111\109\101", } local _IIllIIIIll = { "\084\111\107\111\032\075\111\109\112\117\116\101\114\032\074\097\121\097", "\077\101\098\101\108\032\074\097\116\105", "\071\097\108\101\114\105\032\068\101\107\111\114\097\115\105", "\084\111\107\111\032\065\108\097\116\032\075\097\102\101", "\082\117\109\097\104\032\073\100\097\109\097\110" } local _llllIIllIl = { ["\076\097\110\103\107\097"] = "\108\097\110\103\107\097", ["\083\097\110\103\097\116\032\076\097\110\103\107\097"] = "\115\097\110\103\097\116\095\108\097\110\103\107\097", ["\069\107\115\107\108\117\115\105\102"] = "\101\107\115\107\108\117\115\105\102" } local _IlIlllllIl = { "\076\097\110\103\107\097", "\083\097\110\103\097\116\032\076\097\110\103\107\097", "\069\107\115\107\108\117\115\105\102" } local _llllIIIlll = { langka = 0x1, sangat_langka = 0x2, eksklusif = 0x3 } local _IllIIlIllI = { "\080\067\044\032\067\097\115\101\032\038\032\075\111\110\115\111\108", "\077\111\110\105\116\111\114\032\038\032\084\086", "\075\101\121\098\111\097\114\100", "\077\111\117\115\101", "\077\111\117\115\101\112\097\100", "\077\101\106\097\032\038\032\075\117\114\115\105", "\068\101\107\111\114\097\115\105" } local _IIllllIIlI = { "\084\049\032\040\065\108\108\041", "\084\050\043", "\084\051\043", "\084\052" } local _lllIIlIlIl = { snack = "\083\110\097\099\107", tea = "\069\115\032\084\101\104", soda = "\083\111\100\097", coffee = "\075\111\112\105", noodle = "\077\105\101", rice = "\078\097\115\105" } local _IllIlIlllI = { "\115\110\097\099\107", "\116\101\097", "\115\111\100\097", "\099\111\102\102\101\101", "\110\111\111\100\108\101", "\114\105\099\101" } local _lIlIlIlIlI = { rare = false, minTier = 0x1, rarity = { langka = true, sangat_langka = true, eksklusif = true }, stores = { computer = true, furniture = true, decor = true, kitchen = true, _llllIIIllI = true }, cats = {}, _lllIllIIlI = 0x0, perItem = 0x3, _IlIlIIlIIl = 0x5, restock = false, restockBelow = 0xA, borong = false, bought = 0x0, spent = 0x0, last = "\045", failUntil = {}, } local _IIlIIIIlll = { lowStock = false, below = 0xA, webhookOn = false, webhookUrl = "", dayWebhook = false, autoFair = false, sent = {}, } local function _llIIllIIII(_IIIlIllllI) if type(_IIIlIllllI) ~= "\110\117\109\098\101\114" then return "\063" end
+ local _llIIlllIII = _IIIlIllllI < 0x0 local _IIIIIllIlI = tostring(math.floor(math.abs(_IIIlIllllI) + 0.5)) _IIIIIllIlI = _IIIIIllIlI:reverse():gsub("\040\037\100\037\100\037\100\041", "\037\049\046"):reverse() if _IIIIIllIlI:sub(0x1, 0x1) == "\046" then _IIIIIllIlI = _IIIIIllIlI:sub(0x2) end
+ return (_llIIlllIII and "\045\036" or "\036") .. _IIIIIllIlI end
+ local function _IlIIlIlIll(title, _llllllIlIl, secs) pcall( function () Library:Notify({ Title = title, Description = tostring(_llllllIlIl), Time = secs or 0x4 }) end
+ ) end
+ local function _llIlIlllIl(_llllllIlIl) local _IIIllIIIlI = _IIlIIIIlll.webhookUrl if not _IIlIIIIlll.webhookOn or type(_IIIllIIIlI) ~= "\115\116\114\105\110\103" then return end
+ local _lIIlIlIIII = _IIIllIIIlI:find("\094\104\116\116\112\115\058\047\047\100\105\115\099\111\114\100\037\046\099\111\109\047\097\112\105\047\119\101\098\104\111\111\107\115\047") or _IIIllIIIlI:find("\094\104\116\116\112\115\058\047\047\100\105\115\099\111\114\100\097\112\112\037\046\099\111\109\047\097\112\105\047\119\101\098\104\111\111\107\115\047") or _IIIllIIIlI:find("\094\104\116\116\112\115\058\047\047\112\116\098\037\046\100\105\115\099\111\114\100\037\046\099\111\109\047\097\112\105\047\119\101\098\104\111\111\107\115\047") or _IIIllIIIlI:find("\094\104\116\116\112\115\058\047\047\099\097\110\097\114\121\037\046\100\105\115\099\111\114\100\037\046\099\111\109\047\097\112\105\047\119\101\098\104\111\111\107\115\047") local _lIIlIIllII = getgenv().request or getgenv().http_request or (getgenv().syn and getgenv().syn.request) if not (_lIIlIlIIII and _lIIlIIllII) then return end
+ task.spawn(pcall, _lIIlIIllII, { Url = _IIIllIIIlI, Method = "\080\079\083\084", Headers = { ["\067\111\110\116\101\110\116\045\084\121\112\101"] = "\097\112\112\108\105\099\097\116\105\111\110\047\106\115\111\110" }, Body = HttpService:JSONEncode({ username = "\083\105\107\097\116\032\072\117\098", content = _llllllIlIl }), }) end
+ local function _llIIlIIIll(_IIllIIllIl) local _IIIIlIlIIl = _IIllIIllIl.kind or "" if _IIIIlIlIIl == "\117\110\105\116\095\112\099" or _IIIIlIlIIl == "\117\110\105\116\095\099\111\110\115\111\108\101" then return _IllIIlIllI[0x1] elseif _IIIIlIlIIl == "\100\105\115\112\108\097\121" then return _IllIIlIllI[0x2] elseif _IIIIlIlIIl == "\107\101\121\098\111\097\114\100" then return _IllIIlIllI[0x3] elseif _IIIIlIlIIl == "\109\111\117\115\101" then return _IllIIlIllI[0x4] elseif _IIIIlIlIIl:find("\112\097\100") then return _IllIIlIllI[0x5] elseif _IIIIlIlIIl == "\100\101\115\107" or _IIIIlIlIIl == "\115\101\097\116" then return _IllIIlIllI[0x6] end
+ return _IllIIlIllI[0x7] end
+ local function _IIIllIIIll(store, _IIlIIlllIl) local _IIIIIllIlI = _lIlIlIIlll() local _IIlIIlIllI = _IIIIIllIlI and _IIIIIllIlI.shops and _IIIIIllIlI.shops.shelves and _IIIIIllIlI.shops.shelves[store] return _IIlIIlIllI and _IIlIIlIllI[_IIlIIlllIl] or 0x0 end
+ local function _IlIIlIlIII() local _IIIIIllIlI = _lIlIlIIlll() local _IIIllllIlI = _IIIIIllIlI and _IIIIIllIlI.today and _IIIIIllIlI.today.expense return _IIIllllIlI and _IIIllllIlI.purchases or 0x0 end
+ local function _IIllllIllI(_IIIIIllIlI) local _llIIlIlIII = {} local _IIlllIIlII = _IIIIIllIlI.shops and _IIIIIllIlI.shops.shelves if not _IIlllIIlII then return _llIIlIlIII end
+ local _IlIlIIlIIl = _lIlIlIlIlI.reserve * 1e6 local _lllIllIIlI = _lIlIlIlIlI.maxPrice * 1e6 for store, items in pairs(_IIlllIIlII) do if _lIlIlIlIlI.stores[store] and type(items) == "\116\097\098\108\101" then for _IIlIIlllIl, _IlIIllllll in pairs(items) do local _IIllIIllIl = _IIlIllIlII[_IIlIIlllIl] if _IlIIllllll > 0x0 and _IIllIIllIl and _IIllIIllIl.town and _IIllIIllIl.rarity ~= "\098\105\097\115\097" and _lIlIlIlIlI.rarity[_IIllIIllIl.rarity] then local _lIlIllllll = (_IIllIIllIl.tier or _lIlIlIlIlI.minTier) >= _lIlIlIlIlI.minTier local _IlIlllIlll = _lllIllIIlI <= 0x0 or _IIllIIllIl.price <= _lllIllIIlI local _llIlllIIll = (_IIIIIllIlI.level or 0x1) >= (_IIllIIllIl.level or 0x1) local _IlIIlIIlll = next(_lIlIlIlIlI.cats) == nil or _lIlIlIlIlI.cats[_llIIlIIIll(_IIllIIllIl)] local _IlIlIIllII = (_lIlIlIlIlI.failUntil[_IIlIIlllIl] or 0x0) > os.clock() if _lIlIllllll and _IlIlllIlll and _llIlllIIll and _IlIIlIIlll and not _IlIlIIllII then local _lIlIlllIII = math.floor(((_IIIIIllIlI.money or 0x0) - _IlIlIIlIIl) / math.max(_IIllIIllIl.price, 0x1)) local _lllIlIlIIl = math.min(_IlIIllllll, _lIlIlIlIlI.perItem, _lIlIlllIII) if _lllIlIlIIl >= 0x1 then table.insert(_llIIlIlIII, { store = store, _IIlIIlllIl = _IIlIIlllIl, _IIllIIllIl = _IIllIIllIl, _lllIlIlIIl = _lllIlIlIIl }) end
+ end
+ end
+ end
+ end
+ end
+ table.sort(_llIIlIlIII, function (a, b) local _lIllllIIII, rb = _llllIIIlll[a.it.rarity] or 0x0, _llllIIIlll[b.it.rarity] or 0x0 if _lIllllIIII ~= rb then return _lIllllIIII > rb end
+ return (a.it.tier or 0x0) > (b.it.tier or 0x0) end
+ ) return _llIIlIlIII end
+ local function _lIlllIIIll(_IIIIIllIlI, onlyLow) local _llIIlIlIII = {} local _IIlIIlIllI = _IIIIIllIlI.shops and _IIIIIllIlI.shops.shelves and _IIIIIllIlI.shops.shelves.minimart if not _IIlIIlIllI then return _llIIlIlIII end
+ local _IlIlIIlIIl = _lIlIlIlIlI.reserve * 1e6 for _IIlIIlllIl, _IlIIllllll in pairs(_IIlIIlIllI) do if _IlIIllllll > 0x0 and (_lIlIlIlIlI.failUntil[_IIlIIlllIl] or 0x0) <= os.clock() then local _IllllIIIll = _IIlIIlllIl:gsub("\094\115\116\111\099\107\095", "") local _IIlIlIIlIl = _IIIIIllIlI.stock and _IIIIIllIlI.stock[_IllllIIIll] if type(_IIlIlIIlIl) == "\110\117\109\098\101\114" then local _IIllIIllIl = _IIlIllIlII[_IIlIIlllIl] local _IIlIllIlIl = (_IIllIIllIl and _IIllIIllIl.qty) or 0xA local _lIIIlIlIll = (_IIllIIllIl and _IIllIIllIl.price) or 0x0 local _lIIIlIIlIl = math.floor((_lIIlIllIII - _IIlIlIIlIl) / _IIlIllIlIl) local _lIlIlllIII = _lIIIlIlIll > 0x0 and math.floor(((_IIIIIllIlI.money or 0x0) - _IlIlIIlIIl) / _lIIIlIlIll) or _IlIIllllll local _lllIlIlIIl = math.min(_IlIIllllll, _lIIIlIIlIl, _lIlIlllIII) local _lllIIIllIl = ( not onlyLow) or _IIlIlIIlIl < _lIlIlIlIlI.restockBelow if _lllIIIllIl and _lllIlIlIIl >= 0x1 then table.insert(_llIIlIlIII, { store = "\109\105\110\105\109\097\114\116", _IIlIIlllIl = _IIlIIlllIl, _IIllIIllIl = _IIllIIllIl, _lllIlIlIIl = _lllIlIlIIl }) end
+ end
+ end
+ end
+ return _llIIlIlIII end
+ local function _lIIIIllllI(_IIlIIlllIl, _lllIlIlIIl) for _ = 0x1, _lllIlIlIIl do if not _llIIIllIlI.alive then return end
+ _lllIIllllI:FireServer("\098\117\121", { _IIlIIlllIl = _IIlIIlllIl }) task.wait(0.12) end
+ end
+ local function _IIIIIllllI(store, _IIlIIlllIl, _lllIlIlIIl) if not _lllIIllllI then return 0x0 end
+ local _IlIlllllll, spentBefore = _IIIllIIIll(store, _IIlIIlllIl), _IlIIlIlIII() local _IIllIIllIl = _IIlIllIlII[_IIlIIlllIl] local function _IllllIlIIl() local _IlIllllIII = math.max(0x0, _IlIlllllll - _IIIllIIIll(store, _IIlIIlllIl)) local _lIIIIIIllI = (_IIllIIllIl and _IIllIIllIl.price and _IIllIIllIl.price > 0x0) and math.floor((_IlIIlIlIII() - spentBefore) / _IIllIIllIl.price + 0.5) or 0x0 return math.max(_IlIllllIII, _lIIIIIIllI) end
+ _lIIIIllllI(_IIlIIlllIl, _lllIlIlIIl) task.wait(0.8) local _lIIllllIII = _IllllIlIIl() if _lIIllllIII >= 0x1 then return _lIIllllIII end
+ local _llIlIllIll = _IlIllIlIlI("\115\116\111\114\101", store) if _llIlIllIll and _lIIIIlIlIl("\115\104\111\112", 0x5A) then local _IIlIIIIlll = _lIllIlIIIl() local _llllIIIllI = _IIlIIIIlll and _IIlIIIIlll.Position if _lllIllIllI(_lIIlllIIII(_llIlIllIll, 0x5), { timeout = 0x2D }) then _lIIIIllllI(_IIlIIlllIl, _lllIlIlIIl) task.wait(0.8) _lIIllllIII = _IllllIlIIl() end
+ if _llllIIIllI then _lllIllIllI(_llllIIIllI, { _IllIIlIIIl = 0x0, timeout = 0x2D }) end
+ _IIllllllII("\115\104\111\112") end
+ if _lIIllllIII < 0x1 then _lIlIlIlIlI.failUntil[_IIlIIlllIl] = os.clock() + 0x5A end
+ return _lIIllllIII end
+ local function _IIIIIIIIlI(_IIllIIllIl, _IIlIIlllIl, _lIIllllIII) if _lIIllllIII < 0x1 then return end
+ local _lIIIlIlIll = (_IIllIIllIl and _IIllIIllIl.price) or 0x0 _lIlIlIlIlI.bought = _lIlIlIlIlI.bought + _lIIllllIII _lIlIlIlIlI.spent = _lIlIlIlIlI.spent + _lIIIlIlIll * _lIIllllIII local _IIlIIIllIl = (_IIllIIllIl and _IIllIIllIl.name) or _IIlIIlllIl _lIlIlIlIlI.last = string.format("\037\100\120\032\037\115", _lIIllllIII, _IIlIIIllIl) _IlIIlIlIll("\066\111\117\103\104\116", _lIlIlIlIlI.last .. "\032\040" .. _llIIllIIII(_lIIIlIlIll * _lIIllllIII) .. "\041", 0x4) _llIlIlllIl(string.format("\066\111\117\103\104\116\032\037\100\120\032\042\042\037\115\042\042\032\102\111\114\032\037\115", _lIIllllIII, _IIlIIIllIl, _llIIllIIII(_lIIIlIlIll * _lIIllllIII))) end
+ local function _llllIIllIl(_llIIlIlIII, limit) local _IlIllIlllI = 0x0 for _, j in ipairs(_llIIlIlIII) do if not _llIIIllIlI.alive or _IlIllIlllI >= limit then break end
+ _IIIIIIIIlI(j.it, j.id, _IIIIIllllI(j.store, j.id, j.qty)) _IlIllIlllI = _IlIllIlllI + 0x1 task.wait(0.2) end
+ end
+ local function _lIIllIllll() local _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI or not _IIlllllIll then return end
+ if _lIlIlIlIlI.rare then _llllIIllIl(_IIllllIllI(_IIIIIllIlI), 0x3) end
+ _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI then return end
+ if _lIlIlIlIlI.borong then _llllIIllIl(_lIlllIIIll(_IIIIIllIlI, false), 0x2) elseif _lIlIlIlIlI.restock then _llllIIllIl(_lIlllIIIll(_IIIIIllIlI, true), 0x2) end
+ end
+ local function _IIIlIlllIl() return _lIlIlIlIlI.rare or _lIlIlIlIlI.restock or _lIlIlIlIlI.borong end
+ local _IIIlllIlIl = "\083\105\107\097\116\072\117\098" local _IIIlIlIIll = _IIIlllIlIl .. "\047\104\111\112\046\102\108\097\103" local _lIIIlIIIIl = { _lllllIIllI = false, _IIIllIIIlI = "", settle = 0x14, startedAt = os.clock(), hops = 0x0, busy = false, lastStatus = "\111\102\102", } local function _lIIIIllIll(on) pcall( function () if makefolder and isfolder and not isfolder(_IIIlllIlIl) then makefolder(_IIIlllIlIl) end
+ writefile(_IIIlIlIIll, on and "\049" or "\048") end
+ ) end
+ local function _lIllIlIIIl() local _IllllIIIII, _llllllIlIl = pcall( function () return isfile and isfile(_IIIlIlIIll) and readfile(_IIIlIlIIll) end
+ ) return _IllllIIIII and _llllllIlIl == "\049" end
+ local function _IIlIllIIII(_IIIllIIIlI) return type(_IIIllIIIlI) == "\115\116\114\105\110\103" and _IIIllIIIlI:match("\094\104\116\116\112\115\058\047\047\091\037\119\037\046\095\037\045\047\037\037\063\061\038\058\126\093\043\036") ~= nil end
+ local function _IlIIlIllll() local _IllllIIIII, body = pcall( function () return game:HttpGet(string.format( "\104\116\116\112\115\058\047\047\103\097\109\101\115\046\114\111\098\108\111\120\046\099\111\109\047\118\049\047\103\097\109\101\115\047\037\100\047\115\101\114\118\101\114\115\047\080\117\098\108\105\099\063\115\111\114\116\079\114\100\101\114\061\065\115\099\038\108\105\109\105\116\061\049\048\048", game.PlaceId )) end
+ ) if not _IllllIIIII or type(body) ~= "\115\116\114\105\110\103" then return nil end
+ local _IllIlllIII, _lIIIIIlIII = pcall( function () return HttpService:JSONDecode(body) end
+ ) if not _IllIlllIII or type(_lIIIIIlIII) ~= "\116\097\098\108\101" or type(_lIIIIIlIII.data) ~= "\116\097\098\108\101" then return nil end
+ local _lIIlIllIII = {} for _, server in ipairs(_lIIIIIlIII.data) do if server.id ~= game.JobId and server.playing and server.maxPlayers and server.playing < server.maxPlayers - 0x1 then table.insert(_lIIlIllIII, server.id) end
+ end
+ if #_lIIlIllIII == 0x0 then return nil end
+ return _lIIlIllIII[math.random(#_lIIlIllIII)] end
+ local function _IIIllllIIl() if _lIIIlIIIIl.busy then return end
+ _lIIIlIIIIl.busy = true _lIIIlIIIIl.lastStatus = "\108\111\111\107\105\110\103\032\102\111\114\032\097\032\115\101\114\118\101\114" local _IIlIIlllIl = _IlIIlIllll() if not _IIlIIlllIl then _lIIIlIIIIl.lastStatus = "\110\111\032\115\101\114\118\101\114\032\102\111\117\110\100\044\032\114\101\116\114\121\105\110\103" _lIIIlIIIIl.startedAt = os.clock() - _lIIIlIIIIl.settle + 0x14 _lIIIlIIIIl.busy = false return end
+ local _llIIIIIIIl = getgenv().queue_on_teleport or (getgenv().syn and getgenv().syn.queue_on_teleport) if type(_llIIIIIIIl) == "\102\117\110\099\116\105\111\110" and _IIlIllIIII(_lIIIlIIIIl.url) then pcall(_llIIIIIIIl, string.format("\108\111\097\100\115\116\114\105\110\103\040\103\097\109\101\058\072\116\116\112\071\101\116\040\034\037\115\034\041\041\040\041", _lIIIlIIIIl.url)) end
+ _lIIIlIIIIl.hops = _lIIIlIIIIl.hops + 0x1 _lIIIlIIIIl.lastStatus = "\104\111\112\112\105\110\103" _llIlIlllIl("\083\101\114\118\101\114\032\104\111\112\032\035" .. _lIIIlIIIIl.hops .. "\058\032\110\111\032\119\097\110\116\101\100\032\114\097\114\101\032\105\116\101\109\032\104\101\114\101") pcall( function () TeleportService:TeleportToPlaceInstance(game.PlaceId, _IIlIIlllIl, _IIlIIIlllI) end
+ ) task.wait(0x14) _lIIIlIIIIl.startedAt = os.clock() - _lIIIlIIIIl.settle + 0xA _lIIIlIIIIl.busy = false end
+ local function _lIlIIlIllI() if not _lIIIlIIIIl.enabled or _lIIIlIIIIl.busy then return end
+ if not _lIlIlIlIlI.rare then _lIIIlIIIIl.lastStatus = "\116\117\114\110\032\111\110\032\065\117\116\111\032\098\117\121\032\114\097\114\101\032\102\105\114\115\116" return end
+ if not _IIlIllIIII(_lIIIlIIIIl.url) then _lIIIlIIIIl.lastStatus = "\115\101\116\032\116\104\101\032\114\097\119\032\115\099\114\105\112\116\032\085\082\076\032\102\105\114\115\116" return end
+ if os.clock() - _lIIIlIIIIl.startedAt < _lIIIlIIIIl.settle then _lIIIlIIIIl.lastStatus = "\099\104\101\099\107\105\110\103\032\116\104\105\115\032\115\101\114\118\101\114" return end
+ local _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI then return end
+ if _IIIIIllIlI.holder == "\115\104\111\112" or #_IIllllIllI(_IIIIIllIlI) > 0x0 then _lIIIlIIIIl.lastStatus = "\098\117\121\105\110\103\032\104\101\114\101" _lIIIlIIIIl.startedAt = math.max(_lIIIlIIIIl.startedAt, os.clock() - _lIIIlIIIIl.settle + 0x8) return end
+ _IIIllllIIl() end
+ local _IIIIIlllII = { { _IIlIIlllIl = "\101\115\116\101\104", _llIIlllllI = "\069\115\032\084\101\104\032\083\101\103\097\114", effect = "\099\111\111\107\105\110\103\032\054\048\037\032\102\097\115\116\101\114" }, { _IIlIIlllIl = "\107\111\112\105", _llIIlllllI = "\087\097\114\117\110\103\032\075\111\112\105", effect = "\119\097\108\107\032\051\053\037\032\102\097\115\116\101\114" }, { _IIlIIlllIl = "\098\097\107\115\111", _llIIlllllI = "\066\097\107\115\111\032\077\097\115\032\084\111\110\111", effect = "\080\067\032\114\101\112\097\105\114\032\054\048\037\032\102\097\115\116\101\114" }, { _IIlIIlllIl = "\112\097\100\097\110\103", _llIIlllllI = "\078\097\115\105\032\080\097\100\097\110\103", effect = "\088\080\032\043\051\048\037" }, } local _lIlIIlIlII = { on = {}, _llllIIllIl = {}, itemNames = {}, below = 0x14, bought = 0x0, last = "\045" } local function _lIlIlIIlIl(itemId) local _IIlIlIIllI = _IIlllIlIIl and _IIlllIlIIl.WARUNG_MINUTES return (_IIlIlIIllI and _IIlIlIIllI[itemId]) or (_lllllIIIlI and _lllllIIIlI.BUFF_MINUTES) or 0xF0 end
+ if _lllllIIIlI and _lllllIIIlI.WARUNGS then for _, w in ipairs(_IIIIIlllII) do local _lIIIIIlIII = _lllllIIIlI.WARUNGS[w.id] _lIlIIlIlII.on[w.id] = false _lIlIIlIlII.itemNames[w.id] = {} if _lIIIIIlIII then local _lllllIIlII for _, _llllIIllIl in ipairs(_lIIIIIlIII.items) do local _llIIlllllI = string.format("\037\115\032\040\037\115\041", _llllIIllIl.name, _llIIllIIII(_llllIIllIl.price)) _lIlIIlIlII.itemNames[w.id][_llIIlllllI] = _llllIIllIl.id if not _lllllIIlII or _lIlIlIIlIl(_llllIIllIl.id) > _lIlIlIIlIl(_lllllIIlII) then _lllllIIlII = _llllIIllIl.id end
+ end
+ _lIlIIlIlII.item[w.id] = _lllllIIlII end
+ end
+ end
+ local function _IllIIlIlII() for _, on in pairs(_lIlIIlIlII.on) do if on then return true end
+ end
+ return false end
+ local function _IlIIIIIllI() local _IIlIIllIII = _IIIIlIlIll() local _IIIIIllIlI = _lIlIlIIlll() if not (_IIlIIllIII and _IIIIIllIlI and _lllIIllllI and _lllllIIIlI) then return end
+ local _lIIIIlIlII = _IIlIIllIII.buffs or {} for _, w in ipairs(_IIIIIlllII) do local _lIIIIIlIII = _lllllIIIlI.WARUNGS and _lllllIIIlI.WARUNGS[w.id] local _llllIIllIl = _lIlIIlIlII.item[w.id] if _lIlIIlIlII.on[w.id] and _lIIIIIlIII and _llllIIllIl then local _IIIIlIllll, _lIIIlIlIll = nil, 0x0 for _, _IIllIIllIl in ipairs(_lIIIIIlIII.items) do if _IIllIIllIl.id == _llllIIllIl then _IIIIlIllll = _IIllIIllIl.buff _lIIIlIlIll = _IIllIIllIl.price end
+ end
+ local _IlIIlIllIl = _IIIIlIllll and _lIIIIlIlII[_IIIIlIllll] if ( not _IlIIlIllIl or _IlIIlIllIl < _lIlIIlIlII.below) and (_IIIIIllIlI.money or 0x0) > _lIIIlIlIll * 0x2 then local _llIlIllIll = _IlIllIlIlI("\119\097\114\117\110\103", w.id) if _llIlIllIll and _lIIIIlIlIl("\098\117\102\102", 0x78) then local _IIlIIIIlll = _lIllIlIIIl() local _llllIIIllI = _IIlIIIIlll and _IIlIIIIlll.Position _llIIIllIlI.status = "\071\101\116\116\105\110\103\032\097\032\098\117\102\102\032\097\116\032" .. w.label if _lllIllIllI(_lIIlllIIII(_llIlIllIll, 0x5), { timeout = 0x2D }) then _lllIIllllI:FireServer("\101\097\116", { warung = w.id, _llllIIllIl = _llllIIllIl }) _lIlIIlIlII.bought = _lIlIIlIlII.bought + 0x1 _lIlIIlIlII.last = w.label _IlIIlIlIll("\066\117\102\102", w.label .. "\032\045\032" .. w.effect, 0x4) _llIlIlllIl("\066\117\102\102\032\098\111\117\103\104\116\032\097\116\032\042\042" .. w.label .. "\042\042\032\040" .. w.effect .. "\041") task.wait(0.9) end
+ if _llllIIIllI then _lllIllIllI(_llllIIIllI, { _IllIIlIIIl = 0x0, timeout = 0x2D }) end
+ _IIllllllII("\098\117\102\102") return end
+ end
+ end
+ end
+ end
+ local function _lllIIlllIl() local _IIlIIllIII = _IIIIlIlIll() local _lIIIIlIlII = _IIlIIllIII and _IIlIIllIII.buffs or {} local _llIlIllIIl = {} for _IIlIIlllIl, _IlIIlIllIl in pairs(_lIIIIlIlII) do local _lIlllIIlIl = _lllllIIIlI and _lllllIIIlI.BUFFS and _lllllIIIlI.BUFFS[_IIlIIlllIl] local _IlllIlIlIl = tonumber(_IlIIlIllIl) or 0x0 table.insert(_llIlIllIIl, string.format("\037\115\032\037\100\106\032\037\048\050\100\109", _lIlllIIlIl and _lIlllIIlIl.name or _IIlIIlllIl, math.floor(_IlllIlIlIl / 0x3C), math.floor(_IlllIlIlIl % 0x3C))) end
+ if #_llIlIllIIl == 0x0 then return "\110\111\110\101" end
+ return table.concat(_llIlIllIIl, "\032\032\124\032\032") end
+ local _lIIllllllI, startClock, lastDay = nil, os.clock(), nil local function _llIlIIIIlI(_IIIIIllIlI) local _llllIIllll = _IIIIIllIlI.today or {} local _lllIlIlllI = _llllIIllll.income or {} local _lllIlllIlI = 0x0 for _, v in pairs(_lllIlIlllI) do _lllIlllIlI = _lllIlllIlI + v end
+ local _lllllIIlIl = (_llllIIllll.ratingN and _llllIIllll.ratingN > 0x0) and (_llllIIllll.ratingSum / _llllIIllll.ratingN) or _IIIIIllIlI.rep or 0x0 local _llIIIlIIII = 0x0 for _, ses in pairs(_IIIIIllIlI.sessions or {}) do if ses.playing then _llIIIlIIII = _llIIIlIIII + 0x1 end
+ end
+ local _lIIIllIlll = {} for _, _IllllIIIll in ipairs(_IllIlIlllI) do table.insert(_lIIIllIlll, string.format("\037\115\032\037\115", _lllIIlIlIl[_IllllIIIll], tostring(_IIIIIllIlI.stock and _IIIIIllIlI.stock[_IllllIIIll] or "\063"))) end
+ local _IIllIIIlIl = _IIIIIllIlI.shops and _IIIIIllIlI.shops.next or 0x0 local _lllIIlIlll = (os.clock() - startClock) / 0x3C local _IlIlIIlIII = (_lIIllllllI and _IIIIIllIlI.money) and (_IIIIIllIlI.money - _lIIllllllI) or 0x0 return table.concat({ string.format("\068\097\121\032\037\115\032\032\124\032\032\067\097\115\104\032\037\115\032\032\124\032\032\082\097\116\105\110\103\032\037\046\050\102", tostring(_IIIIIllIlI.day), _llIIllIIII(_IIIIIllIlI.money), _lllllIIlIl), string.format("\067\117\115\116\111\109\101\114\115\032\037\115\032\032\124\032\032\083\101\114\118\101\100\032\037\115\032\032\124\032\032\065\110\103\114\121\032\037\115", tostring(_llllIIllll.customers), tostring(_llllIIllll.served), tostring(_llllIIllll.angry)), string.format("\073\110\099\111\109\101\032\116\111\100\097\121\032\037\115\032\032\040\066\105\108\108\105\110\103\032\037\115\032\124\032\070\111\111\100\032\037\115\032\124\032\084\105\112\115\032\037\115\041", _llIIllIIII(_lllIlllIlI), _llIIllIIII(_lllIlIlllI.billing or 0x0), _llIIllIIII(_lllIlIlllI.food or 0x0), _llIIllIIII(_lllIlIlllI.tip or 0x0)), string.format("\083\112\101\110\116\032\111\110\032\112\117\114\099\104\097\115\101\115\032\116\111\100\097\121\032\037\115", _llIIllIIII((_llllIIllll.expense and _llllIIllll.expense.purchases) or 0x0)), string.format("\065\099\116\105\118\101\032\115\101\115\115\105\111\110\115\032\037\100\032\032\124\032\032\081\117\101\117\101\032\037\100", _llIIIlIIII, #(_IIIIIllIlI.queue or {})), "\083\116\111\099\107\058\032" .. table.concat(_lIIIllIlll, "\032\032"), "\066\117\102\102\115\058\032" .. _lllIIlllIl(), string.format("\083\104\111\112\032\114\101\115\116\111\099\107\032\105\110\032\037\048\050\100\058\037\048\050\100", math.floor(_IIllIIIlIl / 0x3C), math.floor(_IIllIIIlIl % 0x3C)), string.format("\084\104\105\115\032\115\101\115\115\105\111\110\032\037\115\032\032\040\037\115\032\047\032\104\111\117\114\041", _llIIllIIII(_IlIlIIlIII), _llIIllIIII(_lllIIlIlll > 0.5 and _IlIlIIlIII / _lllIIlIlll * 0x3C or 0x0)), }, "\092\110") end
+ local function _IIlIlIlllI(_IIIIIllIlI) local _IIIlIllllI = 0x0 local _IIlllIIlII = _IIIIIllIlI.shops and _IIIIIllIlI.shops.shelves or {} for _, items in pairs(_IIlllIIlII) do for _IIlIIlllIl, _IlIIllllll in pairs(items) do local _IIllIIllIl = _IIlIllIlII[_IIlIIlllIl] if _IlIIllllll > 0x0 and _IIllIIllIl and _IIllIIllIl.town and _IIllIIllIl.rarity ~= "\098\105\097\115\097" then _IIIlIllllI = _IIIlIllllI + _IlIIllllll end
+ end
+ end
+ return _IIIlIllllI end
+ local _lIIIIllIIl if _IIlIIlIlII then _lIIIIllIIl = _IIlIIlIlII.OnClientEvent:Connect( function () if not _IIlIIIIlll.dayWebhook then return end
+ task.delay(0.5, function () local _IIIIIllIlI = _lIlIlIIlll() if _IIIIIllIlI then _llIlIlllIl("\096\096\096\092\110" .. _llIlIIIIlI(_IIIIIllIlI) .. "\092\110\096\096\096") end
+ end
+ ) end
+ ) end
+ local _lIIIlIlIIl = {} local _IllllIlllI = _IlIIllIIll.Main:AddGroupbox({ Side = "\076\101\102\116", Name = "\087\097\114\110\101\116", IconName = "\115\116\111\114\101", }) _IllllIlllI:AddToggle("\070\097\114\109\075\101\101\112\079\112\101\110", { Text = "\075\101\101\112\032\119\097\114\110\101\116\032\111\112\101\110", Default = false, Tooltip = "\079\112\101\110\115\032\116\104\101\032\119\097\114\110\101\116\032\119\104\101\110\101\118\101\114\032\105\116\032\105\115\032\099\108\111\115\101\100\046", Callback = function (value) _lIIllllIlI.keepOpen = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\083\101\114\118\101", { Text = "\065\117\116\111\032\115\101\114\118\101\032\099\117\115\116\111\109\101\114\115", Default = false, Tooltip = "\084\114\097\118\101\108\115\032\116\111\032\101\118\101\114\121\032\119\097\105\116\105\110\103\032\099\117\115\116\111\109\101\114\032\097\110\100\032\115\101\097\116\115\032\116\104\101\109\046", Callback = function (value) _lIIllllIlI.serve = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\068\101\108\105\118\101\114", { Text = "\065\117\116\111\032\100\101\108\105\118\101\114\032\102\111\111\100", Default = false, Tooltip = "\072\097\110\100\115\032\111\118\101\114\032\102\111\111\100\032\111\114\100\101\114\115\032\116\111\032\099\117\115\116\111\109\101\114\115\046", Callback = function (value) _lIIllllIlI.deliver = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\067\111\111\107", { Text = "\065\117\116\111\032\099\111\111\107", Default = false, Tooltip = "\067\111\111\107\115\032\097\032\109\101\110\117\032\105\116\101\109\032\119\104\105\108\101\032\105\116\115\032\115\116\111\099\107\032\105\115\032\098\101\108\111\119\032\116\104\101\032\115\108\105\100\101\114\046", Callback = function (value) _lIIllllIlI.cook = value end
+ , }) _IllllIlllI:AddSlider("\070\097\114\109\067\111\111\107\066\101\108\111\119", { Text = "\067\111\111\107\032\119\104\101\110\032\115\116\111\099\107\032\098\101\108\111\119", Default = 0x6, Min = 0x1, Max = 0x28, Rounding = 0x0, Callback = function (value) _lIIllllIlI.cookBelow = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\067\108\101\097\110", { Text = "\065\117\116\111\032\099\108\101\097\110\032\116\114\097\115\104", Default = false, Callback = function (value) _lIIllllIlI.clean = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\082\101\112\097\105\114", { Text = "\065\117\116\111\032\114\101\112\097\105\114\032\115\116\097\116\105\111\110\115", Default = false, Callback = function (value) _lIIllllIlI.repair = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\076\105\107\101", { Text = "\065\117\116\111\032\108\105\107\101\032\115\105\103\110", Default = false, Tooltip = "\070\105\114\101\115\032\116\104\101\032\108\105\107\101\032\115\105\103\110\032\101\118\101\114\121\032\052\053\032\115\101\099\111\110\100\115\046", Callback = function (value) _lIIllllIlI.like = value end
+ , }) _IllllIlllI:AddToggle("\070\097\114\109\068\097\121\082\101\112\111\114\116", { Text = "\065\117\116\111\032\099\108\111\115\101\032\100\097\121\032\114\101\112\111\114\116", Default = false, Tooltip = "\068\105\115\109\105\115\115\101\115\032\116\104\101\032\101\110\100\032\111\102\032\100\097\121\032\114\101\112\111\114\116\032\115\111\032\105\116\032\110\101\118\101\114\032\098\108\111\099\107\115\032\116\104\101\032\102\097\114\109\046", Callback = function (value) _lIIllllIlI.dayReport = value end
+ , }) _IllllIlllI:AddDivider() local _llIllllIlI = _IllllIlllI:AddLabel("\070\097\114\109\083\116\097\116\117\115", { Text = "\083\101\114\118\101\100\032\048\032\8226\032\067\108\101\097\110\101\100\032\048\032\8226\032\082\101\112\097\105\114\101\100\032\048\032\8226\032\067\111\111\107\101\100\032\048", }) local _lIllIIIlll = _IlIIllIIll.Main:AddGroupbox({ Side = "\076\101\102\116", Name = "\065\117\116\111\032\081\117\101\115\116", IconName = "\115\099\114\111\108\108\045\116\101\120\116", }) _lIllIIIlll:AddToggle("\081\117\101\115\116\065\117\116\111", { Text = "\065\117\116\111\032\113\117\101\115\116", Default = false, Tooltip = "\065\099\099\101\112\116\115\032\111\102\102\101\114\115\032\097\110\100\032\102\105\110\105\115\104\101\115\032\116\104\101\109\058\032\100\101\108\105\118\101\114\044\032\102\101\116\099\104\032\097\110\100\032\116\104\101\032\114\117\110\097\119\097\121\032\099\097\116\046", Callback = function (value) _lIIllIIIll.enabled = value end
+ , }) _lIllIIIlll:AddDropdown("\081\117\101\115\116\084\121\112\101\115", { Values = { "\068\101\108\105\118\101\114", "\070\101\116\099\104", "\067\097\116" }, Default = { "\068\101\108\105\118\101\114", "\070\101\116\099\104", "\067\097\116" }, Multi = true, Text = "\081\117\101\115\116\032\116\121\112\101\115", Callback = function (values) _lIIllIIIll.types = { deliver = values.Deliver == true, fetch = values.Fetch == true, cat = values.Cat == true, } end
+ , }) _lIllIIIlll:AddDivider() local _IIlllIIllI = _lIllIIIlll:AddLabel("\081\117\101\115\116\083\116\097\116\117\115", { Text = "\073\100\108\101", }) local _llIllIlIIl = _IlIIllIIll.Main:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\067\111\108\108\101\099\116", IconName = "\103\105\102\116", }) _llIllIlIIl:AddToggle("\067\111\108\108\101\099\116\071\105\102\116\115", { Text = "\065\117\116\111\032\099\108\097\105\109\032\103\105\102\116\115", Default = false, Tooltip = "\071\114\097\098\115\032\101\118\101\114\121\032\103\105\102\116\032\116\104\097\116\032\115\112\097\119\110\115\032\111\110\032\116\104\101\032\115\116\114\101\101\116\115\046", Callback = function (value) _llllIllIlI.gifts = value end
+ , }) _llIllIlIIl:AddToggle("\067\111\108\108\101\099\116\067\097\114\100\115", { Text = "\065\117\116\111\032\099\108\097\105\109\032\114\097\114\101\032\099\097\114\100\115", Default = false, Tooltip = "\071\114\097\098\115\032\101\118\101\114\121\032\114\097\114\101\032\099\097\114\100\032\116\104\097\116\032\115\112\097\119\110\115\032\105\110\032\116\104\101\032\119\111\114\108\100\046", Callback = function (value) _llllIllIlI.cards = value end
+ , }) _llIllIlIIl:AddDivider() local _IIIIlIllII = _llIllIlIIl:AddLabel("\067\111\108\108\101\099\116\083\116\097\116\117\115", { Text = "\071\105\102\116\115\032\048\032\8226\032\067\097\114\100\115\032\048", }) local _IlIIlIllll = _IlIIllIIll.Main:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\077\111\118\101\109\101\110\116", IconName = "\109\111\118\101", }) _IlIIlIllll:AddSlider("\084\114\097\118\101\108\083\112\101\101\100", { Text = "\084\114\097\118\101\108\032\115\112\101\101\100\032\040\097\117\116\111\032\116\114\105\112\115\041", Default = 0x14, Min = 0xA, Max = 0x18, Rounding = 0x0, Suffix = "\032\115\116\047\115", Tooltip = "\083\112\101\101\100\032\111\102\032\116\104\101\032\116\119\101\101\110\032\117\115\101\100\032\098\121\032\101\118\101\114\121\032\097\117\116\111\032\116\114\105\112\046\032\050\048\032\104\097\100\032\122\101\114\111\032\114\117\098\098\101\114\032\098\097\110\100\105\110\103\032\105\110\032\116\101\115\116\105\110\103\059\032\050\053\032\097\110\100\032\117\112\032\100\105\100\032\110\111\116\046", Callback = function (value) _llllIlllIl.speed = value end
+ , }) _IlIIlIllll:AddToggle("\077\111\118\101\083\112\101\101\100", { Text = "\083\112\101\101\100\032\098\111\111\115\116", Default = false, Tooltip = "\082\101\045\097\112\112\108\105\101\115\032\087\097\108\107\083\112\101\101\100\032\101\118\101\114\121\032\102\114\097\109\101\032\119\104\105\108\101\032\111\110\044\032\097\110\100\032\114\101\115\116\111\114\101\115\032\105\116\032\119\104\101\110\032\111\102\102\046", Callback = function (value) _IllIlIllll.enabled = value if not value then _lIllIlllll() end
+ end
+ , }) _IlIIlIllll:AddSlider("\083\112\101\101\100\086\097\108\117\101", { Text = "\083\112\101\101\100", Default = 0x3C, Min = 0x10, Max = 0x3C, Rounding = 0x0, Tooltip = "\084\104\101\032\103\097\109\101\032\114\101\118\101\114\116\115\032\097\110\121\116\104\105\110\103\032\097\098\111\118\101\032\114\111\117\103\104\108\121\032\054\048\032\115\116\117\100\115\047\115\044\032\115\111\032\116\104\101\032\115\108\105\100\101\114\032\115\116\111\112\115\032\116\104\101\114\101\046", Callback = function (value) _IllIlIllll.value = value end
+ , }) _IlIIlIllll:AddToggle("\077\111\118\101\070\108\121", { Text = "\070\108\121", Default = false, Tooltip = "\083\112\097\099\101\032\061\032\117\112\044\032\076\101\102\116\032\067\116\114\108\032\061\032\100\111\119\110\046", Callback = function (value) _lllIlIIIlI.enabled = value if not value then _IIIlIIIlIl() end
+ end
+ , }) _IlIIlIllll:AddSlider("\070\108\121\086\097\108\117\101", { Text = "\070\108\121\032\115\112\101\101\100", Default = 0x32, Min = 0x14, Max = 0x37, Rounding = 0x0, Callback = function (value) _lllIlIIIlI.speed = value end
+ , }) _IlIIlIllll:AddToggle("\077\111\118\101\078\111\099\108\105\112", { Text = "\078\111\099\108\105\112", Default = false, Tooltip = "\084\114\105\112\115\032\097\108\114\101\097\100\121\032\117\115\101\032\110\111\099\108\105\112\032\097\117\116\111\109\097\116\105\099\097\108\108\121\046\032\084\104\105\115\032\107\101\101\112\115\032\105\116\032\111\110\032\097\108\108\032\116\104\101\032\116\105\109\101\046", Callback = function (value) _IllIlllIIl.noclip = value end
+ , }) _IlIIlIllll:AddToggle("\077\111\118\101\073\110\102\074\117\109\112", { Text = "\073\110\102\105\110\105\116\101\032\106\117\109\112", Default = false, Callback = function (value) _IllIlllIIl.infJump = value end
+ , }) _IlIIlIllll:AddToggle("\077\111\118\101\065\110\116\105\065\102\107", { Text = "\065\110\116\105\032\065\070\075", Default = false, Callback = function (value) _IllIlllIIl.antiAfk = value end
+ , }) local _lllIllllIl = _IlIIllIIll.Shop:AddGroupbox({ Side = "\076\101\102\116", Name = "\065\117\116\111\032\066\117\121\032\082\097\114\101", IconName = "\103\101\109", }) _lllIllllIl:AddToggle("\083\104\111\112\082\097\114\101", { Text = "\065\117\116\111\032\098\117\121\032\114\097\114\101\032\105\116\101\109\115", Default = false, Tooltip = "\066\117\121\115\032\114\097\114\101\032\105\116\101\109\115\032\097\115\032\115\111\111\110\032\097\115\032\097\032\116\111\119\110\032\115\104\111\112\032\115\116\111\099\107\115\032\116\104\101\109\046", Callback = function (value) _lIlIlIlIlI.rare = value end
+ , }) _lllIllllIl:AddDropdown("\083\104\111\112\077\105\110\084\105\101\114", { Values = _IIllllIIlI, Default = _IIllllIIlI[0x1], Text = "\077\105\110\105\109\117\109\032\116\105\101\114", Callback = function (value) for i, _IIlIIIllIl in ipairs(_IIllllIIlI) do if _IIlIIIllIl == value then _lIlIlIlIlI.minTier = i end
+ end
+ end
+ , }) _lllIllllIl:AddDropdown("\083\104\111\112\082\097\114\105\116\121", { Values = _IlIlllllIl, Default = _IlIlllllIl, Multi = true, Text = "\082\097\114\105\116\121\032\102\105\108\116\101\114", Callback = function (values) local _IlIlIIIIII = {} for _llIIlllllI, _IllllIIIll in pairs(_llllIIllIl) do _IlIlIIIIII[_IllllIIIll] = values[_llIIlllllI] == true end
+ _lIlIlIlIlI.rarity = _IlIlIIIIII end
+ , }) _lllIllllIl:AddDropdown("\083\104\111\112\083\116\111\114\101\115", { Values = _IIllIIIIll, Default = _IIllIIIIll, Multi = true, Text = "\084\097\114\103\101\116\032\115\116\111\114\101\115", Callback = function (values) local _IlIlIIIIII = {} for _llIIlllllI, _IllllIIIll in pairs(_IIllllllII) do _IlIlIIIIII[_IllllIIIll] = values[_llIIlllllI] == true end
+ _lIlIlIlIlI.stores = _IlIlIIIIII end
+ , }) _lllIllllIl:AddDropdown("\083\104\111\112\067\097\116\101\103\111\114\105\101\115", { Values = _IllIIlIllI, Default = {}, Multi = true, Text = "\067\097\116\101\103\111\114\121\032\102\105\108\116\101\114\032\040\101\109\112\116\121\032\061\032\097\108\108\041", Callback = function (values) local _IlIlIIIIII = {} for _llIIlllllI, on in pairs(values) do if on == true then _IlIlIIIIII[_llIIlllllI] = true end
+ end
+ _lIlIlIlIlI.cats = _IlIlIIIIII end
+ , }) _lllIllllIl:AddSlider("\083\104\111\112\077\097\120\080\114\105\099\101", { Text = "\077\097\120\032\112\114\105\099\101\032\112\101\114\032\105\116\101\109\032\040\048\032\061\032\110\111\032\108\105\109\105\116\041", Default = 0x0, Min = 0x0, Max = 0x14, Rounding = 0x1, Suffix = "\032\106\116", Callback = function (value) _lIlIlIlIlI.maxPrice = value end
+ , }) _lllIllllIl:AddSlider("\083\104\111\112\080\101\114\073\116\101\109", { Text = "\077\097\120\032\098\111\117\103\104\116\032\112\101\114\032\105\116\101\109", Default = 0x3, Min = 0x1, Max = 0x14, Rounding = 0x0, Callback = function (value) _lIlIlIlIlI.perItem = value end
+ , }) _lllIllllIl:AddSlider("\083\104\111\112\082\101\115\101\114\118\101", { Text = "\075\101\101\112\032\099\097\115\104\032\114\101\115\101\114\118\101", Default = 0x5, Min = 0x0, Max = 0x64, Rounding = 0x0, Suffix = "\032\106\116", Callback = function (value) _lIlIlIlIlI.reserve = value end
+ , }) _lllIllllIl:AddButton({ Text = "\083\099\097\110\032\038\032\098\117\121\032\110\111\119", Func = function () local _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI then return end
+ local _llIIlIlIII = _IIllllIllI(_IIIIIllIlI) if #_llIIlIlIII == 0x0 then _lIlllIlIll("\078\111\032\109\097\116\099\104\105\110\103\032\114\097\114\101\032\105\116\101\109\032\105\110\032\115\116\111\099\107\032\114\105\103\104\116\032\110\111\119\046") return end
+ task.spawn(_llllIIllIl, _llIIlIlIII, 0x5) end
+ , }) local _lIIIlIIIlI = _IlIIllIIll.Shop:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\083\101\114\118\101\114\032\072\111\112\032\040\114\097\114\101\032\104\117\110\116\105\110\103\041", IconName = "\103\108\111\098\101", }) _lIIIlIIIlI:AddToggle("\072\111\112\082\097\114\101", { Text = "\072\111\112\032\115\101\114\118\101\114\115\032\117\110\116\105\108\032\097\032\114\097\114\101\032\105\116\101\109\032\115\104\111\119\115", Default = false, Tooltip = "\078\101\101\100\115\032\065\117\116\111\032\098\117\121\032\114\097\114\101\032\111\110\032\097\110\100\032\116\104\101\032\115\099\114\105\112\116\032\085\082\076\032\098\101\108\111\119\046\032\069\097\099\104\032\115\101\114\118\101\114\032\104\097\115\032\105\116\115\032\111\119\110\032\115\104\111\112\032\115\116\111\099\107\046", Callback = function (value) _lIIIlIIIIl.enabled = value _lIIIlIIIIl.startedAt = os.clock() _lIIIIllIll(value) end
+ , }) _lIIIlIIIlI:AddInput("\072\111\112\085\114\108", { Default = "", Text = "\082\097\119\032\115\099\114\105\112\116\032\085\082\076\032\040\114\117\110\115\032\097\103\097\105\110\032\097\102\116\101\114\032\097\032\104\111\112\041", Placeholder = "\104\116\116\112\115\058\047\047\114\097\119\046\103\105\116\104\117\098\117\115\101\114\099\111\110\116\101\110\116\046\099\111\109\047\121\111\117\047\114\101\112\111\047\109\097\105\110\047\083\105\107\097\116\072\117\098\046\108\117\097\117", Callback = function (value) _lIIIlIIIIl.url = tostring(value or "") end
+ , }) _lIIIlIIIlI:AddSlider("\072\111\112\083\101\116\116\108\101", { Text = "\067\104\101\099\107\032\101\097\099\104\032\115\101\114\118\101\114\032\102\111\114\032\040\115\101\099\111\110\100\115\041", Default = 0x14, Min = 0xA, Max = 0x3C, Rounding = 0x0, Callback = function (value) _lIIIlIIIIl.settle = value end
+ , }) _lIIIlIIIlI:AddButton({ Text = "\072\111\112\032\110\111\119", Func = function () if not _IIlIllIIII(_lIIIlIIIIl.url) then _lIlllIlIll("\083\101\116\032\116\104\101\032\114\097\119\032\115\099\114\105\112\116\032\085\082\076\032\102\105\114\115\116\044\032\115\111\032\116\104\101\032\104\117\098\032\114\101\108\111\097\100\115\032\097\102\116\101\114\032\116\104\101\032\104\111\112\046") return end
+ task.spawn(_IIIllllIIl) end
+ , }) local _lIIlIIlIll = _lIIIlIIIlI:AddLabel("\072\111\112\083\116\097\116\117\115", { Text = "\072\111\112\058\032\111\102\102", DoesWrap = true, }) local _lIlIIllIII = _IlIIllIIll.Shop:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\077\105\110\105\109\097\114\116\032\050\052", IconName = "\115\116\111\114\101", }) _lIlIIllIII:AddToggle("\083\104\111\112\082\101\115\116\111\099\107", { Text = "\065\117\116\111\032\114\101\115\116\111\099\107\032\099\097\102\101", Default = false, Tooltip = "\066\117\121\115\032\097\110\032\105\110\103\114\101\100\105\101\110\116\032\119\104\101\110\032\105\116\115\032\099\097\102\101\032\115\116\111\099\107\032\102\097\108\108\115\032\098\101\108\111\119\032\116\104\101\032\108\105\109\105\116\046", Callback = function (value) _lIlIlIlIlI.restock = value end
+ , }) _lIlIIllIII:AddSlider("\083\104\111\112\082\101\115\116\111\099\107\066\101\108\111\119", { Text = "\082\101\115\116\111\099\107\032\119\104\101\110\032\115\116\111\099\107\032\098\101\108\111\119", Default = 0xA, Min = 0x1, Max = 0x64, Rounding = 0x0, Callback = function (value) _lIlIlIlIlI.restockBelow = value end
+ , }) _lIlIIllIII:AddToggle("\083\104\111\112\066\111\114\111\110\103", { Text = "\065\117\116\111\032\098\111\114\111\110\103\032\040\102\105\108\108\032\101\118\101\114\121\032\105\110\103\114\101\100\105\101\110\116\041", Default = false, Tooltip = "\066\117\121\115\032\077\105\110\105\109\097\114\116\032\115\116\111\099\107\032\119\104\101\110\101\118\101\114\032\116\104\101\032\099\097\102\101\032\104\097\115\032\114\111\111\109\032\040\099\097\112\032\049\048\048\032\112\101\114\032\105\110\103\114\101\100\105\101\110\116\041\046", Callback = function (value) _lIlIlIlIlI.borong = value end
+ , }) _lIlIIllIII:AddButton({ Text = "\082\101\115\116\111\099\107\032\108\111\119\032\105\116\101\109\115\032\110\111\119", Func = function () local _IIIIIllIlI = _lIlIlIIlll() if _IIIIIllIlI then task.spawn(_llllIIllIl, _lIlllIIIll(_IIIIIllIlI, true), 0x4) end
+ end
+ , }) local _IIIIllIIlI = _IlIIllIIll.Shop:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\066\117\121\032\108\111\103", IconName = "\115\099\114\111\108\108\045\116\101\120\116", }) local _lIIIIIlIII = _IIIIllIIlI:AddLabel("\083\104\111\112\083\116\097\116\117\115", { Text = "\066\111\117\103\104\116\032\048\032\105\116\101\109\115", DoesWrap = true, }) local _lIIlIllllI = _IlIIllIIll.Shop:AddGroupbox({ Side = "\076\101\102\116", Name = "\065\117\116\111\032\066\117\102\102", IconName = "\122\097\112", }) for _, w in ipairs(_IIIIIlllII) do local _lIlllIlIll = {} local _IllIIlIlIl for _llIIlllllI, itemId in pairs(_lIlIIlIlII.itemNames[w.id] or {}) do table.insert(_lIlllIlIll, _llIIlllllI) if itemId == _lIlIIlIlII.item[w.id] then _IllIIlIlIl = _llIIlllllI end
+ end
+ table.sort(_lIlllIlIll) if #_lIlllIlIll > 0x0 then _lIIlIllllI:AddToggle("\066\117\102\102\095" .. w.id, { Text = w.label .. "\032\040" .. w.effect .. "\041", Default = false, Callback = function (value) _lIlIIlIlII.on[w.id] = value end
+ , }) _lIIlIllllI:AddDropdown("\066\117\102\102\073\116\101\109\095" .. w.id, { Values = _lIlllIlIll, Default = _IllIIlIlIl or _lIlllIlIll[0x1], Text = w.label .. "\032\105\116\101\109", Callback = function (value) local _IIlIIlllIl = _lIlIIlIlII.itemNames[w.id][value] if _IIlIIlllIl then _lIlIIlIlII.item[w.id] = _IIlIIlllIl end
+ end
+ , }) end
+ end
+ _lIIlIllllI:AddSlider("\066\117\102\102\066\101\108\111\119", { Text = "\082\101\110\101\119\032\119\104\101\110\032\108\101\115\115\032\116\104\097\110\032\040\109\105\110\117\116\101\115\041", Default = 0x14, Min = 0x1, Max = 0x78, Rounding = 0x0, Callback = function (value) _lIlIIlIlII.below = value end
+ , }) _lIIlIllllI:AddDivider() local _llllIlIIll = _lIIlIllllI:AddLabel("\066\117\102\102\083\116\097\116\117\115", { Text = "\078\111\032\098\117\102\102\115\032\097\099\116\105\118\101", DoesWrap = true, }) local _llIlIlllII = _IlIIllIIll.Dashboard:AddGroupbox({ Side = "\076\101\102\116", Name = "\087\097\114\110\101\116\032\115\116\097\116\115", IconName = "\098\097\114\045\099\104\097\114\116\045\051", }) local _lllIIlIllI = _llIlIlllII:AddLabel("\068\097\115\104\083\116\097\116\115", { Text = "\076\111\097\100\105\110\103\046\046\046", DoesWrap = true, }) local _IIIllIllIl = _IlIIllIIll.Dashboard:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\065\108\101\114\116\115\032\038\032\068\105\115\099\111\114\100", IconName = "\098\101\108\108", }) _IIIllIllIl:AddToggle("\065\108\101\114\116\076\111\119\083\116\111\099\107", { Text = "\076\111\119\032\115\116\111\099\107\032\097\108\101\114\116", Default = false, Callback = function (value) _IIlIIIIlll.lowStock = value end
+ , }) _IIIllIllIl:AddSlider("\065\108\101\114\116\066\101\108\111\119", { Text = "\065\108\101\114\116\032\119\104\101\110\032\115\116\111\099\107\032\098\101\108\111\119", Default = 0xA, Min = 0x1, Max = 0x64, Rounding = 0x0, Callback = function (value) _IIlIIIIlll.below = value end
+ , }) _IIIllIllIl:AddToggle("\065\108\101\114\116\087\101\098\104\111\111\107", { Text = "\083\101\110\100\032\101\118\101\110\116\115\032\116\111\032\068\105\115\099\111\114\100\032\119\101\098\104\111\111\107", Default = false, Callback = function (value) _IIlIIIIlll.webhookOn = value end
+ , }) _IIIllIllIl:AddInput("\065\108\101\114\116\087\101\098\104\111\111\107\085\114\108", { Default = "", Text = "\087\101\098\104\111\111\107\032\085\082\076", Placeholder = "\104\116\116\112\115\058\047\047\100\105\115\099\111\114\100\046\099\111\109\047\097\112\105\047\119\101\098\104\111\111\107\115\047\046\046\046", Callback = function (value) _IIlIIIIlll.webhookUrl = tostring(value or "") end
+ , }) _IIIllIllIl:AddButton({ Text = "\083\101\110\100\032\116\101\115\116\032\109\101\115\115\097\103\101", Func = function () _llIlIlllIl("\083\105\107\097\116\032\072\117\098\032\119\101\098\104\111\111\107\032\116\101\115\116\032\045\032\099\111\110\110\101\099\116\101\100\032\097\115\032" .. _IIlIIIlllI.Name) _lIlllIlIll("\087\101\098\104\111\111\107\032\116\101\115\116\032\115\101\110\116\032\040\105\102\032\116\104\101\032\085\082\076\032\105\115\032\118\097\108\105\100\041\046") end
+ , }) _IIIllIllIl:AddToggle("\065\108\101\114\116\068\097\121\087\101\098\104\111\111\107", { Text = "\080\111\115\116\032\097\032\115\117\109\109\097\114\121\032\097\102\116\101\114\032\101\118\101\114\121\032\100\097\121", Default = false, Callback = function (value) _IIlIIIIlll.dayWebhook = value end
+ , }) local _IIIIllIIlI = { { _IIlIIlllIl = "\099\111\109\112\117\116\101\114", _IIlIIIllIl = "\074\097\121\097\032\067\111\109\112\117\116\101\114\032\083\116\111\114\101" }, { _IIlIIlllIl = "\102\117\114\110\105\116\117\114\101", _IIlIIIllIl = "\084\101\097\107\032\070\117\114\110\105\116\117\114\101\032\040\077\101\098\101\108\032\074\097\116\105\041" }, { _IIlIIlllIl = "\100\101\099\111\114", _IIlIIIllIl = "\068\101\099\111\114\097\116\105\111\110\032\071\097\108\108\101\114\121" }, { _IIlIIlllIl = "\107\105\116\099\104\101\110", _IIlIIIllIl = "\067\097\102\101\032\069\113\117\105\112\109\101\110\116\032\083\116\111\114\101" }, { _IIlIIlllIl = "\109\105\110\105\109\097\114\116", _IIlIIIllIl = "\077\105\110\105\109\097\114\116\032\050\052" }, { _IIlIIlllIl = "\104\111\109\101", _IIlIIIllIl = "\082\117\109\097\104\032\073\100\097\109\097\110\032\040\104\111\109\101\032\115\116\111\114\101\041" }, } local _IIIIIlIIlI = { { _IIlIIlllIl = "\098\097\107\115\111", _IIlIIIllIl = "\066\097\107\115\111\032\077\097\115\032\084\111\110\111" }, { _IIlIIlllIl = "\107\111\112\105", _IIlIIIllIl = "\087\097\114\117\110\103\032\075\111\112\105" }, { _IIlIIlllIl = "\112\097\100\097\110\103", _IIlIIIllIl = "\078\097\115\105\032\080\097\100\097\110\103" }, { _IIlIIlllIl = "\101\115\116\101\104", _IIlIIIllIl = "\069\115\032\084\101\104\032\083\101\103\097\114" }, } local function _lllIIIllIl(_lllllllIII, _IIlIIlllIl, _llIIlllllI) local _llIIllIIlI = _IlIllIlIlI(_lllllllIII, _IIlIIlllIl) if not _llIIllIIlI then _lIlllIlIll("\067\111\117\108\100\032\110\111\116\032\102\105\110\100\032" .. tostring(_llIIlllllI or _IIlIIlllIl)) return end
+ local _lllllIIllI if _lllllllIII == "\104\111\117\115\101" then _lllllIIllI = _llIIllIIlI.Position + Vector3.new(0x0, 0x1, -0x5) else _lllllIIllI = _lIIlllIIII(_llIIllIIlI, 0x5) end
+ _llIIIllIlI.status = "\084\114\097\118\101\108\105\110\103\032\116\111\032" .. tostring(_llIIlllllI or _IIlIIlllIl) if _lllIllIllI(_lllllIIllI, { timeout = 0x2D }) then _lIlllIlIll("\065\114\114\105\118\101\100\032\097\116\032" .. tostring(_llIIlllllI or _IIlIIlllIl)) else _lIlllIlIll("\084\114\105\112\032\116\111\032" .. tostring(_llIIlllllI or _IIlIIlllIl) .. "\032\102\097\105\108\101\100\044\032\116\114\121\032\097\103\097\105\110") end
+ end
+ local _lIlllIIIII = _IlIIllIIll.Utility:AddGroupbox({ Side = "\076\101\102\116", Name = "\083\116\111\114\101\115", IconName = "\109\097\112\045\112\105\110", }) for _, store in ipairs(_IIIIllIIlI) do _lIlllIIIII:AddButton({ Text = store.name, Func = function () task.spawn(_lllIIIllIl, "\115\116\111\114\101", store.id, store.name) end
+ , }) end
+ local _IllIlllIll = _IlIIllIIll.Utility:AddGroupbox({ Side = "\076\101\102\116", Name = "\087\097\114\117\110\103\115", IconName = "\117\116\101\110\115\105\108\115", }) for _, warung in ipairs(_IIIIIlIIlI) do _IllIlllIll:AddButton({ Text = warung.name, Func = function () task.spawn(_lllIIIllIl, "\119\097\114\117\110\103", warung.id, warung.name) end
+ , }) end
+ local _lllllIIIlI = _IlIIllIIll.Utility:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\084\114\097\118\101\108", IconName = "\110\097\118\105\103\097\116\105\111\110", }) _lllllIIIlI:AddButton({ Text = "\077\121\032\119\097\114\110\101\116", Func = function () task.spawn( function () local _lIlIlllIll = _lllllllIlI() local _llIIIIlIlI = _lIlIlllIll and _lIlIlllIll:FindFirstChild("\079\098\106\101\099\116\115") and _lIlIlllIll.Objects:FindFirstChild("\111\112\101\114\097\116\111\114\095\100\101\115\107") local _lllllIIllI = _llIIIIlIlI and _llIIIIlIlI.Position or Vector3.new(0x0, 0x0, 0x0) _lllIllIllI(_lllllIIllI + Vector3.new(0x0, 0x0, 0x6), { timeout = 0x2D }) end
+ ) end
+ , }) _lllllIIIlI:AddButton({ Text = "\084\111\119\110\032\099\101\110\116\114\101", Func = function () task.spawn(_lllIllIllI, Vector3.new(0x0, 0x4, -0x14), { timeout = 0x2D }) end
+ , }) _lllllIIIlI:AddButton({ Text = "\083\112\097\119\110", Func = function () local spawn = _lIIIlllllI:FindFirstChild("\083\112\097\119\110\076\111\099\097\116\105\111\110") if spawn then task.spawn(_lllIllIllI, spawn.Position, { timeout = 0x2D }) end
+ end
+ , }) _lllllIIIlI:AddDivider() _lllllIIIlI:AddButton({ Text = "\082\101\106\111\105\110\032\115\101\114\118\101\114", Func = function () pcall( function () TeleportService:Teleport(game.PlaceId, _IIlIIIlllI) end
+ ) end
+ , }) _lllllIIIlI:AddButton({ Text = "\085\110\108\111\097\100\032\104\117\098", Func = function () if _llIIIllIlI.unload then _llIIIllIlI.unload() end
+ end
+ , }) local _IlllIIIIlI = _IlIIllIIll.Utility:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\080\101\114\102\111\114\109\097\110\099\101", IconName = "\103\097\117\103\101", }) _IlllIIIIlI:AddToggle("\080\101\114\102\078\111\082\101\110\100\101\114", { Text = "\065\070\075\032\115\097\118\101\114\032\040\051\068\032\114\101\110\100\101\114\105\110\103\032\111\102\102\041", Default = false, Tooltip = "\084\117\114\110\115\032\051\068\032\114\101\110\100\101\114\105\110\103\032\111\102\102\032\115\111\032\097\032\108\111\110\103\032\102\097\114\109\032\115\101\115\115\105\111\110\032\117\115\101\115\032\097\108\109\111\115\116\032\110\111\032\071\080\085\046", Callback = function (value) pcall( function () RunService:Set3dRenderingEnabled( not value) end
+ ) end
+ , }) _IlllIIIIlI:AddToggle("\080\101\114\102\076\111\119\071\102\120", { Text = "\076\111\119\032\103\114\097\112\104\105\099\115", Default = false, Callback = function (value) pcall( function () if value then if _lIIIlIlIIl.shadows == nil then _lIIIlIlIIl.shadows = Lighting.GlobalShadows end
+ _lIIIlIlIIl.quality = _lIIIlIlIIl.quality or settings().Rendering.QualityLevel Lighting.GlobalShadows = false settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 else if _lIIIlIlIIl.shadows ~= nil then Lighting.GlobalShadows = _lIIIlIlIIl.shadows end
+ if _lIIIlIlIIl.quality then settings().Rendering.QualityLevel = _lIIIlIlIIl.quality end
+ end
+ end
+ ) end
+ , }) _IlllIIIIlI:AddSlider("\080\101\114\102\070\112\115\067\097\112", { Text = "\070\080\083\032\099\097\112", Default = 0x3C, Min = 0xF, Max = 0xF0, Rounding = 0x0, Callback = function (value) local _IlIlllIlll = getgenv().setfpscap if type(_IlIlllIlll) == "\102\117\110\099\116\105\111\110" then pcall(_IlIlllIlll, value) end
+ end
+ , }) local _llIIIIlIII = _IlIIllIIll.Utility:AddGroupbox({ Side = "\082\105\103\104\116", Name = "\083\104\111\112\032\116\111\111\108\115", IconName = "\119\114\101\110\099\104", }) _llIIIIlIII:AddButton({ Text = "\070\097\105\114\032\112\114\105\099\101\115\032\102\111\114\032\101\118\101\114\121\116\104\105\110\103", Func = function () if _lllIIllllI then _lllIIllllI:FireServer("\112\114\105\099\101\070\097\105\114\065\108\108", {}) _lIlllIlIll("\070\097\105\114\032\112\114\105\099\101\115\032\097\112\112\108\105\101\100\046") end
+ end
+ , }) _llIIIIlIII:AddToggle("\084\111\111\108\115\065\117\116\111\070\097\105\114", { Text = "\065\117\116\111\032\102\097\105\114\032\112\114\105\099\101\115\032\101\118\101\114\121\032\110\101\119\032\100\097\121", Default = false, Callback = function (value) _IIlIIIIlll.autoFair = value end
+ , }) local _IIIIIIIIll = _IlIIllIIll.Settings:AddGroupbox({ Side = "\076\101\102\116", Name = "\077\101\110\117", IconName = "\109\101\110\117", }) _IIIIIIIIll:AddLabel("\077\101\110\117\032\107\101\121"):AddKeyPicker("\077\101\110\117\075\101\121\098\105\110\100", { Default = "\082\105\103\104\116\065\108\116", NoUI = true, Text = "\077\101\110\117\032\107\101\121\098\105\110\100", }) Library.ToggleKeybind = Library.Options.MenuKeybind _IIIIIIIIll:AddToggle("\070\108\111\097\116\066\117\116\116\111\110", { Text = "\070\108\111\097\116\105\110\103\032\109\101\110\117\032\098\117\116\116\111\110", Default = UserInputService.TouchEnabled, Tooltip = "\065\032\100\114\097\103\103\097\098\108\101\032\039\077\101\110\117\039\032\098\117\116\116\111\110\032\116\104\097\116\032\111\112\101\110\115\032\097\110\100\032\099\108\111\115\101\115\032\116\104\105\115\032\119\105\110\100\111\119\046\032\079\110\032\098\121\032\100\101\102\097\117\108\116\032\111\110\032\109\111\098\105\108\101\046", Callback = function (value) _IIlIIIllll.enabled = value _IlIIlIlIlI() end
+ , }) _IIIIIIIIll:AddButton({ Text = "\083\104\111\119\032\047\032\104\105\100\101\032\109\101\110\117", Func = _IlIIIIllIl, }) _IIIIIIIIll:AddLabel("\068\101\102\097\117\108\116\032\107\101\121\058\032\082\105\103\104\116\065\108\116\046\032\067\108\105\099\107\032\116\104\101\032\107\101\121\032\097\098\111\118\101\032\116\111\032\114\101\098\105\110\100\032\105\116\046", true) if _llIllIlIlI then pcall( function () _llIllIlIlI:SetLibrary(Library) _llIllIlIlI:IgnoreThemeSettings() _llIllIlIlI:SetIgnoreIndexes({ "\077\101\110\117\075\101\121\098\105\110\100" }) _llIllIlIlI:SetFolder("\083\105\107\097\116\072\117\098\047\087\097\114\110\101\116\111\112\105\097") _llIllIlIlI:BuildConfigSection(_IlIIllIIll.Settings) _llIllIlIlI:LoadAutoloadConfig() end
+ ) end
+ if _IIIlIlllIl then pcall( function () _IIIlIlllIl:SetLibrary(Library) _IIIlIlllIl:SetFolder("\083\105\107\097\116\072\117\098") _IIIlIlllIl:ApplyToTab(_IlIIllIIll.Settings) end
+ ) end
+ _IIlIIIllll.enabled = Library.Toggles.FloatButton and Library.Toggles.FloatButton.Value or _IIlIIIllll.enabled _IlIIlIlIlI() if _lIllIlIIIl() then pcall( function () Library.Toggles.ShopRare:SetValue(true) Library.Toggles.HopRare:SetValue(true) end
+ ) _lIIIlIIIIl.enabled = true _lIlIlIlIlI.rare = true _lIIIlIIIIl.startedAt = os.clock() end
+ local _llllllllll = RunService.RenderStepped:Connect( function (dt) if _lllIlIIIlI.enabled then local _IIlIIIIlll = _lIllIlIIIl() local _IlIlIllllI = _lllIlIIIIl() local _llllIlIllI = _lIIIlllllI.CurrentCamera if _IIlIIIIlll and _IlIlIllllI and _llllIlIllI then if not _lllIlIIIlI.savedSpeed then _lllIlIIIlI.savedSpeed = _IlIlIllllI.WalkSpeed _IlIlIllllI.WalkSpeed = 0x0 end
+ local _IlIlIlIlll = Vector3.zero if UserInputService:IsKeyDown(Enum.KeyCode.W) then _IlIlIlIlll += _llllIlIllI.CFrame.LookVector end
+ if UserInputService:IsKeyDown(Enum.KeyCode.S) then _IlIlIlIlll -= _llllIlIllI.CFrame.LookVector end
+ if UserInputService:IsKeyDown(Enum.KeyCode.A) then _IlIlIlIlll -= _llllIlIllI.CFrame.RightVector end
+ if UserInputService:IsKeyDown(Enum.KeyCode.D) then _IlIlIlIlll += _llllIlIllI.CFrame.RightVector end
+ if UserInputService:IsKeyDown(Enum.KeyCode.Space) then _IlIlIlIlll += Vector3.new(0x0, 0x1, 0x0) end
+ if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then _IlIlIlIlll -= Vector3.new(0x0, 0x1, 0x0) end
+ if _IlIlIlIlll.Magnitude > 0x0 then local _IllIlIIIll = math.min(_lllIlIIIlI.speed, 0x37) local _IIlIlIllII = _IllIlIIIll * math.min(dt, 0.05) _IIlIIIIlll.CFrame = CFrame.new(_IIlIIIIlll.Position + _IlIlIlIlll.Unit * _IIlIlIllII) end
+ return end
+ elseif _lllIlIIIlI.savedSpeed then local _IlIlIllllI = _lllIlIIIIl() if _IlIlIllllI then _IlIlIllllI.WalkSpeed = _lllIlIIIlI.savedSpeed end
+ _lllIlIIIlI.savedSpeed = nil end
+ if _IllIlIllll.enabled and not _llllIlllIl.active then _lllIlIIIIl() end
+ end
+ ) local _IIIlIIlllI = RunService.Stepped:Connect( function () if not (_IllIlllIIl.noclip or _llllIlllIl.active) then return end
+ local _IllllIIIll = _lllIlIIllI() if not _IllllIIIll then return end
+ for _, _llIIllIIlI in ipairs(_IllllIIIll:GetDescendants()) do if _llIIllIIlI:IsA("\066\097\115\101\080\097\114\116") and _llIIllIIlI.CanCollide then _llIIllIIlI.CanCollide = false end
+ end
+ end
+ ) local _IllIIIIIlI = UserInputService.JumpRequest:Connect( function () if not _IllIlllIIl.infJump then return end
+ local _IlIlIllllI = _lllIlIIIIl() if _IlIlIllllI then _IlIlIllllI:ChangeState(Enum.HumanoidStateType.Jumping) end
+ end
+ ) local _IIIIlIlIIl = _IIlIIIlllI.Idled:Connect( function () if not _IllIlllIIl.antiAfk then return end
+ pcall( function () _IlllIIIlII:CaptureController() _IlllIIIlII:ClickButton2(Vector2.new()) end
+ ) end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _IlIlIIIlII() then pcall(_IIlIIIIlIl) task.wait(0.35) else task.wait(0.6) end
+ end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _lIIllIIIll.enabled then pcall(_IIllIlIIIl) task.wait(0.7) else task.wait(0.8) end
+ end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _llllIllIlI.gifts or _llllIllIlI.cards then pcall(_llIlllIlII) task.wait(0.5) else task.wait(0.8) end
+ end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _IIIlIlllIl() then pcall(_lIIllIllll) task.wait(1.2) else task.wait(0x1) end
+ end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _lIIIlIIIIl.enabled then pcall(_lIlIIlIllI) else _lIIIlIIIIl.lastStatus = "\111\102\102" end
+ task.wait(0x2) end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do if _IllIIlIlII() then pcall(_IlIIIIIllI) end
+ task.wait(0x3) end
+ end
+ ) task.spawn( function () while _llIIIllIlI.alive do pcall( function () if _llIllllIlI then _llIllllIlI:SetText(string.format( "\083\101\114\118\101\100\032\037\100\032\8226\032\068\101\108\105\118\101\114\101\100\032\037\100\032\8226\032\067\108\101\097\110\101\100\032\037\100\032\8226\032\082\101\112\097\105\114\101\100\032\037\100\032\8226\032\067\111\111\107\101\100\032\037\100", _lIIllllIlI.served, _lIIllllIlI.delivered, _lIIllllIlI.cleaned, _lIIllllIlI.repaired, _lIIllllIlI.cooked )) end
+ if _IIlllIIllI then local _IIlIIllIII = _IIIIlIlIll() local _llIIIlIIII = _IIlIIllIII and _IIlIIllIII.active local _llIlIlIIll = _llIIIlIIII and tostring(_llIIIlIIII.stage) or "\105\100\108\101" local _IIlIIIllIl = _llIIIlIIII and tostring(_llIIIlIIII.name or "") or "" _IIlllIIllI:SetText(string.format("\083\116\097\103\101\058\032\037\115\032\037\115\032\8226\032\097\099\099\101\112\116\101\100\032\037\100", _llIlIlIIll, _IIlIIIllIl, _lIIllIIIll.accepted)) end
+ if _IIIIlIllII then _IIIIlIllII:SetText(string.format("\071\105\102\116\115\032\037\100\032\8226\032\067\097\114\100\115\032\037\100", _llllIllIlI.giftsClaimed, _llllIllIlI.cardsClaimed)) end
+ if _lIIlIIlIll then _lIIlIIlIll:SetText(string.format("\072\111\112\058\032\037\115\032\8226\032\104\111\112\115\032\116\104\105\115\032\114\117\110\058\032\037\100", _lIIIlIIIIl.lastStatus, _lIIIlIIIIl.hops)) end
+ local _IIIIIllIlI = _lIlIlIIlll() if not _IIIIIllIlI then return end
+ if _IIIIIllIlI.money and not _lIIllllllI then _lIIllllllI = _IIIIIllIlI.money end
+ if _lllIIlIllI then _lllIIlIllI:SetText(_llIlIIIIlI(_IIIIIllIlI)) end
+ if _lIIIIIlIII then _lIIIIIlIII:SetText(string.format( "\066\111\117\103\104\116\032\037\100\032\105\116\101\109\115\032\040\037\115\041\092\110\076\097\115\116\058\032\037\115\092\110\082\097\114\101\032\105\110\032\115\116\111\099\107\032\110\111\119\058\032\037\100", _lIlIlIlIlI.bought, _llIIllIIII(_lIlIlIlIlI.spent), _lIlIlIlIlI.last, _IIlIlIlllI(_IIIIIllIlI) )) end
+ if _llllIlIIll then _llllIlIIll:SetText(string.format("\065\099\116\105\118\101\058\032\037\115\092\110\066\111\117\103\104\116\032\037\100\032\8226\032\108\097\115\116\058\032\037\115", _lllIIlllIl(), _lIlIIlIlII.bought, _lIlIIlIlII.last)) end
+ if lastDay and _IIIIIllIlI.day and _IIIIIllIlI.day ~= lastDay and _IIlIIIIlll.autoFair and _lllIIllllI then _lllIIllllI:FireServer("\112\114\105\099\101\070\097\105\114\065\108\108", {}) end
+ lastDay = _IIIIIllIlI.day if _IIlIIIIlll.lowStock then for _, _IllllIIIll in ipairs(_IllIlIlllI) do local _IIlIlIIlIl = _IIIIIllIlI.stock and _IIIIIllIlI.stock[_IllllIIIll] if type(_IIlIlIIlIl) == "\110\117\109\098\101\114" and _IIlIlIIlIl < _IIlIIIIlll.below and os.clock() - (_IIlIIIIlll.sent[_IllllIIIll] or -0x3E7) > 0x78 then _IIlIIIIlll.sent[_IllllIIIll] = os.clock() _IlIIlIlIll("\076\111\119\032\115\116\111\099\107", _lllIIlIlIl[_IllllIIIll] .. "\032\105\115\032\100\111\119\110\032\116\111\032" .. _IIlIlIIlIl, 0x5) _llIlIlllIl(string.format("\076\111\119\032\115\116\111\099\107\058\032\042\042\037\115\042\042\032\105\115\032\100\111\119\110\032\116\111\032\037\100", _lllIIlIlIl[_IllllIIIll], _IIlIlIIlIl)) end
+ end
+ end
+ end
+ ) task.wait(0x1) end
+ end
+ ) _llIIIllIlI.api = { teleport = _lllIIIllIl, _lllIllIllI = _lllIllIllI, travel = _llllIlllIl, farm = _lIIllllIlI, quest = _lIIllIIIll, collect = _llllIllIlI, shop = _lIlIlIlIlI, buff = _lIlIIlIlII, hop = _lIIIlIIIIl, _IllIlIIIll = _IllIlIllll, fly = _lllIlIIIlI, misc = _IllIlllIIl, _IlIIIIllIl = _IlIIIIllIl, _IIlIIIIlIl = _IIlIIIIlIl, _IIllIlIIIl = _IIllIlIIIl, _llIlllIlII = _llIlllIlII, _lIIllIllll = _lIIllIllll, _IlIIIIIllI = _IlIIIIIllI, _lIlIIlIllI = _lIlIIlIllI, _lIllIIIlII = _lIllIIIlII, _IlIIIllIIl = _IlIIIllIIl, } _llIIIllIlI.unload = function () _llIIIllIlI.alive = false _llllIlllIl.active = false _IIlIIlIlll() pcall(_lIllIlllll) pcall(_IIIlIIIlIl) pcall( function () RunService:Set3dRenderingEnabled(true) end
+ ) for _, c in ipairs({ _llllllllll, _IIIlIIlllI, _IllIIIIIlI, _IIIIlIlIIl, _IlIlllIlll, _IIlIIIllll, _lIIIIllIIl }) do pcall( function () c:Disconnect() end
+ ) end
+ pcall( function () Library:Unload() end
+ ) if getgenv().SikatHub == _llIIIllIlI then getgenv().SikatHub = nil end
+ end
+ Library:OnUnload( function () _llIIIllIlI.alive = false _llllIlllIl.active = false _IIlIIlIlll() pcall(_lIllIlllll) pcall(_IIIlIIIlIl) pcall( function () RunService:Set3dRenderingEnabled(true) end
+ ) end
+ ) _lIlllIlIll("\083\105\107\097\116\032\072\117\098\032\118\051\046\049\032\108\111\097\100\101\100\046\032\077\101\110\117\032\107\101\121\058\032\082\105\103\104\116\065\108\116\046") end
+ )(...)
